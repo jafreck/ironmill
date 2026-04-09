@@ -16,6 +16,43 @@ use crate::ir::{Operation, ScalarType, TensorData, Value};
 use crate::proto::onnx::{NodeProto, TensorProto};
 
 // ---------------------------------------------------------------------------
+// Static dispatch tables for trivial unary/binary op mappings
+// ---------------------------------------------------------------------------
+
+/// ONNX → MIL unary op name mappings.
+const UNARY_OPS: &[(&str, &str)] = &[
+    ("Relu", "relu"),
+    ("Sigmoid", "sigmoid"),
+    ("Tanh", "tanh"),
+    ("Sqrt", "sqrt"),
+    ("Erf", "erf"),
+    ("Sin", "sin"),
+    ("Cos", "cos"),
+    ("Neg", "neg"),
+    ("Reciprocal", "reciprocal"),
+    ("Gelu", "gelu"),
+    ("Silu", "silu"),
+    ("Log", "log"),
+    ("Exp", "exp"),
+    ("Abs", "abs"),
+    ("Ceil", "ceil"),
+    ("Floor", "floor"),
+    ("Not", "logical_not"),
+];
+
+/// ONNX → MIL binary op name mappings.
+const BINARY_OPS: &[(&str, &str)] = &[
+    ("Add", "add"),
+    ("Mul", "mul"),
+    ("Pow", "pow"),
+    ("Div", "real_div"),
+    ("Sub", "sub"),
+    ("Equal", "equal"),
+    ("Less", "less"),
+    ("Greater", "greater"),
+];
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -27,34 +64,37 @@ use crate::proto::onnx::{NodeProto, TensorProto};
 ///
 /// Returns [`MilError::UnsupportedOp`] if the ONNX op type is not recognized.
 pub fn convert_node(node: &NodeProto) -> Result<Vec<Operation>> {
+    // Table-driven dispatch for trivial unary/binary ops.
+    if let Some(&(_, mil_op)) = UNARY_OPS.iter().find(|&&(onnx, _)| onnx == node.op_type) {
+        return Ok(convert_unary(node, mil_op));
+    }
+    if let Some(&(_, mil_op)) = BINARY_OPS.iter().find(|&&(onnx, _)| onnx == node.op_type) {
+        return Ok(convert_binary(node, mil_op));
+    }
+
     match node.op_type.as_str() {
         // P0 — Essential ops
         "Conv" => Ok(convert_conv(node)),
         "MatMul" => Ok(convert_matmul(node)),
         "Gemm" => Ok(convert_gemm(node)),
-        "Relu" => Ok(convert_unary(node, "relu")),
-        "Add" => Ok(convert_binary(node, "add")),
-        "Mul" => Ok(convert_binary(node, "mul")),
         "Reshape" => Ok(convert_reshape(node)),
         "Transpose" => Ok(convert_transpose(node)),
         "Softmax" => Ok(convert_softmax(node)),
         "BatchNormalization" => Ok(convert_batch_norm(node)),
-        "MaxPool" => Ok(convert_pool(node, "max_pool")),
-        "AveragePool" => Ok(convert_pool(node, "avg_pool")),
-        "GlobalAveragePool" => Ok(convert_global_pool(node, "avg_pool")),
+        "MaxPool" => Ok(convert_pool(node, "max_pool", false)),
+        "AveragePool" => Ok(convert_pool(node, "avg_pool", false)),
+        "GlobalAveragePool" => Ok(convert_pool(node, "avg_pool", true)),
         "Concat" => Ok(convert_concat(node)),
         "Flatten" => Ok(convert_flatten(node)),
 
         // P1 — Important ops
-        "Sigmoid" => Ok(convert_unary(node, "sigmoid")),
-        "Tanh" => Ok(convert_unary(node, "tanh")),
         "Clip" => Ok(convert_clip(node)),
         "Gather" => Ok(convert_gather(node)),
         "Unsqueeze" => Ok(convert_unsqueeze(node)),
         "Squeeze" => Ok(convert_squeeze(node)),
         "Slice" => Ok(convert_slice(node)),
         "Pad" => Ok(convert_pad(node)),
-        "ReduceMean" => Ok(convert_reduce_mean(node)),
+        "ReduceMean" => Ok(convert_reduce(node, "reduce_mean")),
         "LayerNormalization" => Ok(convert_layer_norm(node)),
         "Cast" => convert_cast(node),
         "Constant" => convert_constant(node),
@@ -63,38 +103,17 @@ pub fn convert_node(node: &NodeProto) -> Result<Vec<Operation>> {
         "Shape" => Ok(convert_shape(node)),
         "Split" => Ok(convert_split(node)),
         "Where" => Ok(convert_where(node)),
-        "Pow" => Ok(convert_binary(node, "pow")),
-        "Sqrt" => Ok(convert_unary(node, "sqrt")),
-        "Div" => Ok(convert_binary(node, "real_div")),
-        "Sub" => Ok(convert_binary(node, "sub")),
-        "Erf" => Ok(convert_unary(node, "erf")),
         "ConvTranspose" => Ok(convert_conv_transpose(node)),
         "Resize" => Ok(convert_resize(node)),
 
         // Dropout is an identity in inference mode.
-        "Dropout" => Ok(convert_identity(node)),
+        "Dropout" | "Identity" => Ok(convert_identity(node)),
 
         // P3 — Transformer / LLM ops
-        "Sin" => Ok(convert_unary(node, "sin")),
-        "Cos" => Ok(convert_unary(node, "cos")),
-        "Neg" => Ok(convert_unary(node, "neg")),
-        "Reciprocal" => Ok(convert_unary(node, "reciprocal")),
-        "Gelu" => Ok(convert_unary(node, "gelu")),
-        "Silu" => Ok(convert_unary(node, "silu")),
-        "Log" => Ok(convert_unary(node, "log")),
-        "Exp" => Ok(convert_unary(node, "exp")),
-        "Abs" => Ok(convert_unary(node, "abs")),
-        "Ceil" => Ok(convert_unary(node, "ceil")),
-        "Floor" => Ok(convert_unary(node, "floor")),
-        "Identity" => Ok(convert_identity(node)),
-        "Equal" => Ok(convert_binary(node, "equal")),
-        "Less" => Ok(convert_binary(node, "less")),
-        "Greater" => Ok(convert_binary(node, "greater")),
-        "Not" => Ok(convert_unary(node, "logical_not")),
         "CumSum" => Ok(convert_cumsum(node)),
         "Tile" => Ok(convert_tile(node)),
         "Expand" => Ok(convert_expand(node)),
-        "ReduceSum" => Ok(convert_reduce_sum(node)),
+        "ReduceSum" => Ok(convert_reduce(node, "reduce_sum")),
 
         // P4 — ONNX Runtime contrib ops (com.microsoft domain)
         "SimplifiedLayerNormalization" => Ok(convert_simplified_layer_norm(node)),
@@ -431,11 +450,18 @@ fn convert_batch_norm(node: &NodeProto) -> Vec<Operation> {
     vec![with_outputs(op, node)]
 }
 
-/// MaxPool / AveragePool: map kernel_shape, strides, pads.
-fn convert_pool(node: &NodeProto, mil_op: &str) -> Vec<Operation> {
+/// MaxPool / AveragePool / GlobalAveragePool: map kernel_shape, strides, pads.
+fn convert_pool(node: &NodeProto, mil_op: &str, global: bool) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x"]);
     let mut op = Operation::new(mil_op, op_name(node));
     op.inputs = inputs;
+
+    if global {
+        // Global pooling: kernel covers the entire spatial extent. We set
+        // kernel_sizes in propagate_output_types once the input shape is known.
+        op = op.with_attr("global_pool", Value::Bool(true));
+        return vec![with_outputs(op, node)];
+    }
 
     if let Some(kernel_shape) = get_int_list_attr(node, "kernel_shape") {
         op = op.with_attr("kernel_sizes", int_tensor_value(&kernel_shape));
@@ -472,18 +498,6 @@ fn convert_pool(node: &NodeProto, mil_op: &str) -> Vec<Operation> {
         );
     }
 
-    vec![with_outputs(op, node)]
-}
-
-/// GlobalAveragePool: maps to avg_pool with a `global` flag.
-fn convert_global_pool(node: &NodeProto, mil_op: &str) -> Vec<Operation> {
-    let inputs = positional_to_named(node, &["x"]);
-    let mut op = Operation::new(mil_op, op_name(node));
-    op.inputs = inputs;
-    // Global pooling: kernel covers the entire spatial extent. We set
-    // kernel_sizes in propagate_output_types once the input shape is known.
-    // Mark as global via an internal attribute (skipped in proto serialization).
-    op = op.with_attr("global_pool", Value::Bool(true));
     vec![with_outputs(op, node)]
 }
 
@@ -669,28 +683,33 @@ fn convert_pad(node: &NodeProto) -> Vec<Operation> {
     vec![with_outputs(op, node)]
 }
 
-/// ReduceMean: handles both attribute (opset ≤ 17) and input (opset 18+) axes.
-fn convert_reduce_mean(node: &NodeProto) -> Vec<Operation> {
-    let mut op = Operation::new("reduce_mean", op_name(node));
+/// ReduceMean / ReduceSum: handles both attribute (opset ≤ 17) and input (opset 18+) axes.
+fn convert_reduce(node: &NodeProto, mil_op: &str) -> Vec<Operation> {
+    let mut op = Operation::new(mil_op, op_name(node));
 
     if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
         op.inputs
             .insert("x".to_string(), Value::Reference(x.clone()));
     }
 
-    // Attribute form
-    if let Some(axes) = get_int_list_attr(node, "axes") {
-        op = op.with_attr("axes", int_tensor_value(&axes));
-    }
-    // Input form (opset 18+)
+    // axes: input[1] (opset 13+/18+) or attribute form
     if let Some(axes_input) = node.input.get(1).filter(|s| !s.is_empty()) {
         op.inputs
             .insert("axes".to_string(), Value::Reference(axes_input.clone()));
+    } else if let Some(axes) = get_int_list_attr(node, "axes") {
+        op = op.with_attr("axes", int_tensor_value(&axes));
     }
 
     // ONNX defaults keepdims=1; CoreML requires keep_dims to be present.
     let keepdims = get_int_attr(node, "keepdims").unwrap_or(1);
     op = op.with_attr("keep_dims", Value::Bool(keepdims != 0));
+
+    // ReduceSum-specific: noop_with_empty_axes
+    if mil_op == "reduce_sum" {
+        if let Some(noop) = get_int_attr(node, "noop_with_empty_axes") {
+            op = op.with_attr("noop_with_empty_axes", Value::Bool(noop != 0));
+        }
+    }
 
     vec![with_outputs(op, node)]
 }
@@ -910,36 +929,6 @@ fn convert_expand(node: &NodeProto) -> Vec<Operation> {
 }
 
 // ---------------------------------------------------------------------------
-// P3+ — ReduceSum
-// ---------------------------------------------------------------------------
-
-fn convert_reduce_sum(node: &NodeProto) -> Vec<Operation> {
-    let mut op = Operation::new("reduce_sum", op_name(node));
-
-    if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
-        op.inputs
-            .insert("x".to_string(), Value::Reference(x.clone()));
-    }
-
-    // axes: input[1] (opset 13+) or attribute form
-    if let Some(axes_input) = node.input.get(1).filter(|s| !s.is_empty()) {
-        op.inputs
-            .insert("axes".to_string(), Value::Reference(axes_input.clone()));
-    } else if let Some(axes) = get_int_list_attr(node, "axes") {
-        op = op.with_attr("axes", int_tensor_value(&axes));
-    }
-
-    let keepdims = get_int_attr(node, "keepdims").unwrap_or(1);
-    op = op.with_attr("keep_dims", Value::Bool(keepdims != 0));
-
-    if let Some(noop) = get_int_attr(node, "noop_with_empty_axes") {
-        op = op.with_attr("noop_with_empty_axes", Value::Bool(noop != 0));
-    }
-
-    vec![with_outputs(op, node)]
-}
-
-// ---------------------------------------------------------------------------
 // P4 — ONNX Runtime contrib ops (com.microsoft domain)
 // ---------------------------------------------------------------------------
 
@@ -1115,159 +1104,76 @@ fn convert_rotary_embedding(node: &NodeProto) -> Vec<Operation> {
             .with_output(&sin_gathered),
     );
 
-    if interleaved {
-        // Interleaved layout: pairs (x0,x1), (x2,x3), ... are rotated together.
-        // Reshape x to [..., head_dim/2, 2], rotate, reshape back.
-        // For simplicity, we use the same split-rotate-concat approach:
-        // even indices get cos*x_even - sin*x_odd, odd get sin*x_even + cos*x_odd.
-        // This is equivalent to the non-interleaved path with a different split.
+    // Split x along last dim into halves, apply rotation, concat back.
+    // Interleaved and non-interleaved paths share the same math:
+    //   part1 = half1*cos - half2*sin
+    //   part2 = half1*sin + half2*cos
+    // Only the concat interleave flag differs.
+    let half1 = format!("{name}_half1");
+    let half2 = format!("{name}_half2");
+    ops.push(
+        Operation::new("split", format!("{name}_split"))
+            .with_input("x", Value::Reference(x_ref))
+            .with_attr("num_splits", Value::Int(2))
+            .with_attr("axis", Value::Int(-1))
+            .with_output(&half1)
+            .with_output(&half2),
+    );
 
-        // Split x along last dim into pairs
-        let half1 = format!("{name}_half1");
-        let half2 = format!("{name}_half2");
-        ops.push(
-            Operation::new("split", format!("{name}_split"))
-                .with_input("x", Value::Reference(x_ref))
-                .with_attr("num_splits", Value::Int(2))
-                .with_attr("axis", Value::Int(-1))
-                .with_output(&half1)
-                .with_output(&half2),
-        );
+    let h1_cos = format!("{name}_h1_cos");
+    ops.push(
+        Operation::new("mul", format!("{name}_h1_cos_op"))
+            .with_input("x", Value::Reference(half1.clone()))
+            .with_input("y", Value::Reference(cos_gathered.clone()))
+            .with_output(&h1_cos),
+    );
+    let h2_sin = format!("{name}_h2_sin");
+    ops.push(
+        Operation::new("mul", format!("{name}_h2_sin_op"))
+            .with_input("x", Value::Reference(half2.clone()))
+            .with_input("y", Value::Reference(sin_gathered.clone()))
+            .with_output(&h2_sin),
+    );
+    let part1 = format!("{name}_part1");
+    ops.push(
+        Operation::new("sub", format!("{name}_sub"))
+            .with_input("x", Value::Reference(h1_cos))
+            .with_input("y", Value::Reference(h2_sin))
+            .with_output(&part1),
+    );
 
-        // half1 * cos - half2 * sin
-        let h1_cos = format!("{name}_h1_cos");
-        ops.push(
-            Operation::new("mul", format!("{name}_h1_cos_op"))
-                .with_input("x", Value::Reference(half1.clone()))
-                .with_input("y", Value::Reference(cos_gathered.clone()))
-                .with_output(&h1_cos),
-        );
-        let h2_sin = format!("{name}_h2_sin");
-        ops.push(
-            Operation::new("mul", format!("{name}_h2_sin_op"))
-                .with_input("x", Value::Reference(half2.clone()))
-                .with_input("y", Value::Reference(sin_gathered.clone()))
-                .with_output(&h2_sin),
-        );
-        let part1 = format!("{name}_part1");
-        ops.push(
-            Operation::new("sub", format!("{name}_sub"))
-                .with_input("x", Value::Reference(h1_cos))
-                .with_input("y", Value::Reference(h2_sin))
-                .with_output(&part1),
-        );
+    let h1_sin = format!("{name}_h1_sin");
+    ops.push(
+        Operation::new("mul", format!("{name}_h1_sin_op"))
+            .with_input("x", Value::Reference(half1))
+            .with_input("y", Value::Reference(sin_gathered))
+            .with_output(&h1_sin),
+    );
+    let h2_cos = format!("{name}_h2_cos");
+    ops.push(
+        Operation::new("mul", format!("{name}_h2_cos_op"))
+            .with_input("x", Value::Reference(half2))
+            .with_input("y", Value::Reference(cos_gathered))
+            .with_output(&h2_cos),
+    );
+    let part2 = format!("{name}_part2");
+    ops.push(
+        Operation::new("add", format!("{name}_add"))
+            .with_input("x", Value::Reference(h1_sin))
+            .with_input("y", Value::Reference(h2_cos))
+            .with_output(&part2),
+    );
 
-        // half1 * sin + half2 * cos
-        let h1_sin = format!("{name}_h1_sin");
-        ops.push(
-            Operation::new("mul", format!("{name}_h1_sin_op"))
-                .with_input("x", Value::Reference(half1))
-                .with_input("y", Value::Reference(sin_gathered))
-                .with_output(&h1_sin),
-        );
-        let h2_cos = format!("{name}_h2_cos");
-        ops.push(
-            Operation::new("mul", format!("{name}_h2_cos_op"))
-                .with_input("x", Value::Reference(half2))
-                .with_input("y", Value::Reference(cos_gathered))
-                .with_output(&h2_cos),
-        );
-        let part2 = format!("{name}_part2");
-        ops.push(
-            Operation::new("add", format!("{name}_add"))
-                .with_input("x", Value::Reference(h1_sin))
-                .with_input("y", Value::Reference(h2_cos))
-                .with_output(&part2),
-        );
-
-        // Concat halves back
-        ops.push(
-            Operation::new("concat", format!("{name}_concat"))
-                .with_input(
-                    "values",
-                    Value::List(vec![Value::Reference(part1), Value::Reference(part2)]),
-                )
-                .with_attr("axis", Value::Int(-1))
-                .with_attr("interleave", Value::Bool(true))
-                .with_output(&output_name),
-        );
-    } else {
-        // Non-interleaved (default): first half and second half of head_dim.
-        // x = [x1, x2] where x1 = x[..., :d/2], x2 = x[..., d/2:]
-        // out = [x1*cos - x2*sin, x1*sin + x2*cos]
-        let half1 = format!("{name}_half1");
-        let half2 = format!("{name}_half2");
-        ops.push(
-            Operation::new("split", format!("{name}_split"))
-                .with_input("x", Value::Reference(x_ref))
-                .with_attr("num_splits", Value::Int(2))
-                .with_attr("axis", Value::Int(-1))
-                .with_output(&half1)
-                .with_output(&half2),
-        );
-
-        // half1 * cos
-        let h1_cos = format!("{name}_h1_cos");
-        ops.push(
-            Operation::new("mul", format!("{name}_h1_cos_op"))
-                .with_input("x", Value::Reference(half1.clone()))
-                .with_input("y", Value::Reference(cos_gathered.clone()))
-                .with_output(&h1_cos),
-        );
-        // half2 * sin
-        let h2_sin = format!("{name}_h2_sin");
-        ops.push(
-            Operation::new("mul", format!("{name}_h2_sin_op"))
-                .with_input("x", Value::Reference(half2.clone()))
-                .with_input("y", Value::Reference(sin_gathered.clone()))
-                .with_output(&h2_sin),
-        );
-        // part1 = h1*cos - h2*sin
-        let part1 = format!("{name}_part1");
-        ops.push(
-            Operation::new("sub", format!("{name}_sub"))
-                .with_input("x", Value::Reference(h1_cos))
-                .with_input("y", Value::Reference(h2_sin))
-                .with_output(&part1),
-        );
-
-        // half1 * sin
-        let h1_sin = format!("{name}_h1_sin");
-        ops.push(
-            Operation::new("mul", format!("{name}_h1_sin_op"))
-                .with_input("x", Value::Reference(half1))
-                .with_input("y", Value::Reference(sin_gathered))
-                .with_output(&h1_sin),
-        );
-        // half2 * cos
-        let h2_cos = format!("{name}_h2_cos");
-        ops.push(
-            Operation::new("mul", format!("{name}_h2_cos_op"))
-                .with_input("x", Value::Reference(half2))
-                .with_input("y", Value::Reference(cos_gathered))
-                .with_output(&h2_cos),
-        );
-        // part2 = h1*sin + h2*cos
-        let part2 = format!("{name}_part2");
-        ops.push(
-            Operation::new("add", format!("{name}_add"))
-                .with_input("x", Value::Reference(h1_sin))
-                .with_input("y", Value::Reference(h2_cos))
-                .with_output(&part2),
-        );
-
-        // Concat halves back along last dim
-        ops.push(
-            Operation::new("concat", format!("{name}_concat"))
-                .with_input(
-                    "values",
-                    Value::List(vec![Value::Reference(part1), Value::Reference(part2)]),
-                )
-                .with_attr("axis", Value::Int(-1))
-                .with_attr("interleave", Value::Bool(false))
-                .with_output(&output_name),
-        );
-    }
+    ops.push(
+        Operation::new("concat", format!("{name}_concat"))
+            .with_input(
+                "values",
+                Value::List(vec![Value::Reference(part1), Value::Reference(part2)]),
+            )
+            .with_attr("axis", Value::Int(-1))
+            .with_attr("interleave", Value::Bool(interleaved))
+            .with_output(&output_name),
+    );
 
     ops
 }

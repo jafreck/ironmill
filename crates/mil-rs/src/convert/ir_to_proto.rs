@@ -502,7 +502,7 @@ pub fn program_to_multi_function_model(
         let proto_func = convert_function(shared_func)?;
         // Track all const ops from the shared function.
         for op in &shared_func.body.operations {
-            if op.op_type == "const" || op.op_type.starts_with("constexpr_") {
+            if is_const_like(op) {
                 seen_consts.insert(op.name.clone(), true);
             }
         }
@@ -582,9 +582,7 @@ fn dedup_expert_function(
 
     let mut operations = Vec::new();
     for op in &func.body.operations {
-        if (op.op_type == "const" || op.op_type.starts_with("constexpr_"))
-            && shared_consts.contains_key(&op.name)
-        {
+        if is_const_like(op) && shared_consts.contains_key(&op.name) {
             // This const is shared with the backbone — emit a lightweight
             // stub that preserves the name and type but carries no data.
             operations.push(convert_operation_stub(op, &mut type_map)?);
@@ -671,6 +669,11 @@ fn convert_operation_stub(
         blocks: vec![],
         attributes,
     })
+}
+
+/// Returns `true` if the operation is a constant or constexpr variant.
+fn is_const_like(op: &Operation) -> bool {
+    op.op_type == "const" || op.op_type.starts_with("constexpr_")
 }
 
 // ---------------------------------------------------------------------------
@@ -778,7 +781,7 @@ fn convert_operation(
     for (param, value) in &op.inputs {
         // For const ops, `val` must be a proto attribute (not an input).
         // Some passes (bn_weight_fold, constant_fold) store it in inputs.
-        if (op.op_type == "const" || op.op_type.starts_with("constexpr_")) && param == "val" {
+        if is_const_like(op) && param == "val" {
             continue; // handled below in the attributes section
         }
         inputs.insert(param.clone(), convert_value_to_argument(value)?);
@@ -849,10 +852,7 @@ fn convert_operation(
             // different dtype (e.g., FP16) than the val attribute (e.g., FP32).
             // For linear ops, always use inferred type from x input to ensure
             // output rank matches x (not weight) rank.
-            let vt = if op.op_type == "const"
-                || op.op_type.starts_with("constexpr_")
-                || op.op_type == "linear"
-            {
+            let vt = if is_const_like(op) || op.op_type == "linear" {
                 inferred_type.clone()
             } else {
                 op.output_types
@@ -881,7 +881,7 @@ fn convert_operation(
     let mut attributes = HashMap::new();
     // For const ops, `val` might be in inputs (from optimization passes).
     // Promote it to a proto attribute.
-    if op.op_type == "const" || op.op_type.starts_with("constexpr_") {
+    if is_const_like(op) {
         if let Some(val) = op.inputs.get("val") {
             if !op.attributes.contains_key("val") {
                 attributes.insert("val".to_string(), convert_value_to_proto(val)?);
@@ -889,7 +889,7 @@ fn convert_operation(
         }
     }
     for (attr_name, attr_val) in &op.attributes {
-        if op.op_type == "const" || op.op_type.starts_with("constexpr_") {
+        if is_const_like(op) {
             // For const and constexpr ops, all attributes stay as proto
             // attributes (lut, indices, quantized_data, etc.).
             attributes.insert(attr_name.clone(), convert_value_to_proto(attr_val)?);
@@ -1240,6 +1240,25 @@ fn scalar_value_type(dt: mil_spec::DataType) -> mil_spec::ValueType {
     }
 }
 
+/// Build a 1-D tensor `ValueType` of the given element type and length.
+fn vector_value_type(dt: mil_spec::DataType, len: usize) -> mil_spec::ValueType {
+    let dim = mil_spec::Dimension {
+        dimension: Some(mil_spec::dimension::Dimension::Constant(
+            mil_spec::dimension::ConstantDimension { size: len as u64 },
+        )),
+    };
+    mil_spec::ValueType {
+        r#type: Some(mil_spec::value_type::Type::TensorType(
+            mil_spec::TensorType {
+                data_type: dt as i32,
+                rank: 1,
+                dimensions: vec![dim],
+                attributes: HashMap::new(),
+            },
+        )),
+    }
+}
+
 /// Derive the `ValueType` that describes an IR `Value`.
 fn value_type_for(value: &Value) -> Option<mil_spec::ValueType> {
     match value {
@@ -1290,59 +1309,11 @@ fn value_type_for(value: &Value) -> Option<mil_spec::ValueType> {
                 } else {
                     mil_spec::DataType::Int64
                 };
-                let dim = mil_spec::Dimension {
-                    dimension: Some(mil_spec::dimension::Dimension::Constant(
-                        mil_spec::dimension::ConstantDimension {
-                            size: items.len() as u64,
-                        },
-                    )),
-                };
-                Some(mil_spec::ValueType {
-                    r#type: Some(mil_spec::value_type::Type::TensorType(
-                        mil_spec::TensorType {
-                            data_type: dt as i32,
-                            rank: 1,
-                            dimensions: vec![dim],
-                            attributes: HashMap::new(),
-                        },
-                    )),
-                })
+                Some(vector_value_type(dt, items.len()))
             } else if items.iter().all(|v| matches!(v, Value::Float(_))) {
-                let dim = mil_spec::Dimension {
-                    dimension: Some(mil_spec::dimension::Dimension::Constant(
-                        mil_spec::dimension::ConstantDimension {
-                            size: items.len() as u64,
-                        },
-                    )),
-                };
-                Some(mil_spec::ValueType {
-                    r#type: Some(mil_spec::value_type::Type::TensorType(
-                        mil_spec::TensorType {
-                            data_type: mil_spec::DataType::Float32 as i32,
-                            rank: 1,
-                            dimensions: vec![dim],
-                            attributes: HashMap::new(),
-                        },
-                    )),
-                })
+                Some(vector_value_type(mil_spec::DataType::Float32, items.len()))
             } else if items.iter().all(|v| matches!(v, Value::Bool(_))) {
-                let dim = mil_spec::Dimension {
-                    dimension: Some(mil_spec::dimension::Dimension::Constant(
-                        mil_spec::dimension::ConstantDimension {
-                            size: items.len() as u64,
-                        },
-                    )),
-                };
-                Some(mil_spec::ValueType {
-                    r#type: Some(mil_spec::value_type::Type::TensorType(
-                        mil_spec::TensorType {
-                            data_type: mil_spec::DataType::Bool as i32,
-                            rank: 1,
-                            dimensions: vec![dim],
-                            attributes: HashMap::new(),
-                        },
-                    )),
-                })
+                Some(vector_value_type(mil_spec::DataType::Bool, items.len()))
             } else {
                 // Mixed types: fall back to list type.
                 let elem_type = items

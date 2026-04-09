@@ -139,6 +139,102 @@ pub fn detect_lora_adapters(
     adapters
 }
 
+/// Validated LoRA merge parameters (computed once by `validate_lora_merge`).
+struct ValidatedMerge {
+    out_features: usize,
+    in_features: usize,
+    rank: usize,
+    scale: f32,
+}
+
+/// Validate LoRA merge inputs and return the computed parameters.
+fn validate_lora_merge(
+    base_len: usize,
+    base_shape: &[usize],
+    a_shape: &[usize],
+    b_shape: &[usize],
+    a_len: usize,
+    b_len: usize,
+    dtype: ScalarType,
+    alpha: Option<f64>,
+    context: &str,
+) -> Result<ValidatedMerge> {
+    if base_shape.len() != 2 {
+        return Err(MilError::Validation(format!(
+            "LoRA merge requires 2-D base weight, got shape {base_shape:?}{context}"
+        )));
+    }
+    if a_shape.len() != 2 || b_shape.len() != 2 {
+        return Err(MilError::Validation(format!(
+            "LoRA A and B must be 2-D{context}"
+        )));
+    }
+
+    let out_features = base_shape[0];
+    let in_features = base_shape[1];
+    let rank = a_shape[0];
+    let a_in = a_shape[1];
+    let b_out = b_shape[0];
+    let b_rank = b_shape[1];
+
+    if a_in != in_features {
+        return Err(MilError::Validation(format!(
+            "LoRA A in_features ({a_in}) != base in_features ({in_features}){context}"
+        )));
+    }
+    if b_out != out_features {
+        return Err(MilError::Validation(format!(
+            "LoRA B out_features ({b_out}) != base out_features ({out_features}){context}"
+        )));
+    }
+    if b_rank != rank {
+        return Err(MilError::Validation(format!(
+            "LoRA rank mismatch: A has rank {rank}, B has rank {b_rank}{context}"
+        )));
+    }
+
+    let dtype_size = match dtype {
+        ScalarType::Float32 => 4,
+        ScalarType::Float16 => 2,
+        other => {
+            return Err(MilError::Validation(format!(
+                "LoRA merge unsupported for dtype {other:?}{context}"
+            )));
+        }
+    };
+
+    let expected_base = out_features * in_features * dtype_size;
+    if base_len < expected_base {
+        return Err(MilError::Validation(format!(
+            "base buffer too small: got {} bytes, expected {expected_base}{context}",
+            base_len
+        )));
+    }
+    let expected_a = rank * a_in * dtype_size;
+    if a_len < expected_a {
+        return Err(MilError::Validation(format!(
+            "LoRA A buffer too small: got {} bytes, expected {expected_a}{context}",
+            a_len
+        )));
+    }
+    let expected_b = b_out * b_rank * dtype_size;
+    if b_len < expected_b {
+        return Err(MilError::Validation(format!(
+            "LoRA B buffer too small: got {} bytes, expected {expected_b}{context}",
+            b_len
+        )));
+    }
+
+    let scale = (alpha.unwrap_or(rank as f64) / rank as f64) as f32;
+
+    Ok(ValidatedMerge {
+        out_features,
+        in_features,
+        rank,
+        scale,
+    })
+}
+
 /// Merge a LoRA adapter into a base weight tensor in-place.
 ///
 /// Applies `W_new = W + (alpha / rank) * B @ A` element-wise in the base
@@ -154,36 +250,6 @@ pub fn merge_lora(
     base_dtype: ScalarType,
     adapter: &LoraAdapter,
 ) -> Result<()> {
-    if base_shape.len() != 2 {
-        return Err(MilError::Validation(format!(
-            "LoRA merge requires 2-D base weight, got shape {:?} for '{}'",
-            base_shape, adapter.base_name
-        )));
-    }
-
-    let [out_features, in_features] = [base_shape[0], base_shape[1]];
-    let [rank, a_in] = adapter.a_shape;
-    let [b_out, b_rank] = adapter.b_shape;
-
-    if a_in != in_features {
-        return Err(MilError::Validation(format!(
-            "LoRA A in_features ({a_in}) != base in_features ({in_features}) for '{}'",
-            adapter.base_name
-        )));
-    }
-    if b_out != out_features {
-        return Err(MilError::Validation(format!(
-            "LoRA B out_features ({b_out}) != base out_features ({out_features}) for '{}'",
-            adapter.base_name
-        )));
-    }
-    if b_rank != rank {
-        return Err(MilError::Validation(format!(
-            "LoRA rank mismatch: A has rank {rank}, B has rank {b_rank} for '{}'",
-            adapter.base_name
-        )));
-    }
-
     if base_dtype != adapter.dtype {
         return Err(MilError::Validation(format!(
             "dtype mismatch: base is {:?}, adapter is {:?} for '{}'",
@@ -191,59 +257,35 @@ pub fn merge_lora(
         )));
     }
 
-    let scale = adapter.alpha.unwrap_or(rank as f64) / rank as f64;
-
-    // Validate buffer sizes before accessing raw bytes.
-    let dtype_size = match base_dtype {
-        ScalarType::Float32 => 4,
-        ScalarType::Float16 => 2,
-        other => {
-            return Err(MilError::Validation(format!(
-                "LoRA merge unsupported for dtype {:?} on '{}'",
-                other, adapter.base_name
-            )));
-        }
-    };
-
-    let expected_base_bytes = out_features * in_features * dtype_size;
-    if base_data.len() < expected_base_bytes {
-        return Err(MilError::Validation(format!(
-            "base weight buffer too small: got {} bytes, expected {} for '{}'",
-            base_data.len(),
-            expected_base_bytes,
-            adapter.base_name
-        )));
-    }
-
-    let expected_a_bytes = rank * a_in * dtype_size;
-    if adapter.a_data.len() < expected_a_bytes {
-        return Err(MilError::Validation(format!(
-            "LoRA A buffer too small: got {} bytes, expected {} for '{}'",
-            adapter.a_data.len(),
-            expected_a_bytes,
-            adapter.base_name
-        )));
-    }
-
-    let expected_b_bytes = b_out * b_rank * dtype_size;
-    if adapter.b_data.len() < expected_b_bytes {
-        return Err(MilError::Validation(format!(
-            "LoRA B buffer too small: got {} bytes, expected {} for '{}'",
-            adapter.b_data.len(),
-            expected_b_bytes,
-            adapter.base_name
-        )));
-    }
+    let ctx = format!(" for '{}'", adapter.base_name);
+    let v = validate_lora_merge(
+        base_data.len(),
+        base_shape,
+        &adapter.a_shape,
+        &adapter.b_shape,
+        adapter.a_data.len(),
+        adapter.b_data.len(),
+        base_dtype,
+        adapter.alpha,
+        &ctx,
+    )?;
 
     match base_dtype {
-        ScalarType::Float32 => merge_f32(base_data, out_features, in_features, adapter, scale),
-        ScalarType::Float16 => merge_f16(base_data, out_features, in_features, adapter, scale),
-        other => {
-            return Err(MilError::Validation(format!(
-                "LoRA merge unsupported for dtype {:?} on '{}'",
-                other, adapter.base_name
-            )));
-        }
+        ScalarType::Float32 => merge_f32(
+            base_data,
+            v.out_features,
+            v.in_features,
+            adapter,
+            v.scale as f64,
+        ),
+        ScalarType::Float16 => merge_f16(
+            base_data,
+            v.out_features,
+            v.in_features,
+            adapter,
+            v.scale as f64,
+        ),
+        _ => unreachable!(), // validated above
     }
 
     Ok(())
@@ -314,101 +356,42 @@ pub fn merge_lora_weights(
     base_shape: &[usize],
     lora: &LoraWeights<'_>,
 ) -> Result<()> {
-    if base_shape.len() != 2 {
-        return Err(MilError::Validation(format!(
-            "LoRA merge requires 2-D base weight, got shape {base_shape:?}"
-        )));
-    }
-    if lora.lora_a_shape.len() != 2 || lora.lora_b_shape.len() != 2 {
-        return Err(MilError::Validation("LoRA A and B must be 2-D".into()));
-    }
-
-    let out_features = base_shape[0];
-    let in_features = base_shape[1];
-    let rank = lora.lora_a_shape[0];
-    let a_in = lora.lora_a_shape[1];
-    let b_out = lora.lora_b_shape[0];
-    let b_rank = lora.lora_b_shape[1];
-
-    if a_in != in_features {
-        return Err(MilError::Validation(format!(
-            "LoRA A in_features ({a_in}) != base in_features ({in_features})"
-        )));
-    }
-    if b_out != out_features {
-        return Err(MilError::Validation(format!(
-            "LoRA B out_features ({b_out}) != base out_features ({out_features})"
-        )));
-    }
-    if b_rank != rank {
-        return Err(MilError::Validation(format!(
-            "LoRA rank mismatch: A has rank {rank}, B has rank {b_rank}"
-        )));
-    }
-
-    let scale = lora.alpha.unwrap_or(rank as f64) / rank as f64;
-
-    let dtype_size = match lora.dtype {
-        ScalarType::Float32 => 4,
-        ScalarType::Float16 => 2,
-        other => {
-            return Err(MilError::Validation(format!(
-                "LoRA merge unsupported for dtype {other:?}"
-            )));
-        }
-    };
-
-    let expected_base = out_features * in_features * dtype_size;
-    if base.len() < expected_base {
-        return Err(MilError::Validation(format!(
-            "base buffer too small: got {} bytes, expected {expected_base}",
-            base.len()
-        )));
-    }
-    let expected_a = rank * a_in * dtype_size;
-    if lora.lora_a.len() < expected_a {
-        return Err(MilError::Validation(format!(
-            "LoRA A buffer too small: got {} bytes, expected {expected_a}",
-            lora.lora_a.len()
-        )));
-    }
-    let expected_b = b_out * b_rank * dtype_size;
-    if lora.lora_b.len() < expected_b {
-        return Err(MilError::Validation(format!(
-            "LoRA B buffer too small: got {} bytes, expected {expected_b}",
-            lora.lora_b.len()
-        )));
-    }
+    let v = validate_lora_merge(
+        base.len(),
+        base_shape,
+        lora.lora_a_shape,
+        lora.lora_b_shape,
+        lora.lora_a.len(),
+        lora.lora_b.len(),
+        lora.dtype,
+        lora.alpha,
+        "",
+    )?;
 
     match lora.dtype {
         ScalarType::Float32 => {
             merge_f32_raw(
                 base,
-                out_features,
-                in_features,
+                v.out_features,
+                v.in_features,
                 lora.lora_a,
                 lora.lora_b,
-                rank,
-                scale as f32,
+                v.rank,
+                v.scale,
             );
         }
         ScalarType::Float16 => {
             merge_f16_raw(
                 base,
-                out_features,
-                in_features,
+                v.out_features,
+                v.in_features,
                 lora.lora_a,
                 lora.lora_b,
-                rank,
-                scale as f32,
+                v.rank,
+                v.scale,
             );
         }
-        other => {
-            return Err(MilError::TypeMismatch {
-                expected: "Float32 or Float16".into(),
-                actual: format!("{other:?}"),
-            });
-        }
+        _ => unreachable!(), // validated above
     }
 
     Ok(())

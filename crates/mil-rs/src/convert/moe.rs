@@ -185,7 +185,6 @@ pub struct MoeFuseResult {
 
 struct RouterInfo {
     op_indices: Vec<usize>,
-    output_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -547,32 +546,8 @@ fn detect_by_name(
     let mut sorted: Vec<(usize, Vec<usize>)> = expert_groups.into_iter().collect();
     sorted.sort_by_key(|(id, _)| *id);
     let expert_op_indices: Vec<Vec<usize>> = sorted.into_iter().map(|(_, v)| v).collect();
-    let expert_count = expert_op_indices.len();
 
-    // Everything else is shared
-    let mut assigned: HashSet<usize> = HashSet::new();
-    for group in &expert_op_indices {
-        assigned.extend(group);
-    }
-    assigned.extend(&router_indices);
-    let shared_op_indices: Vec<usize> = (0..ops.len()).filter(|i| !assigned.contains(i)).collect();
-
-    let router_output = router_indices
-        .last()
-        .and_then(|&i| ops[i].outputs.first().cloned())
-        .unwrap_or_default();
-
-    let (expert_input_names, expert_output_names) = compute_expert_io(ops, &expert_op_indices);
-
-    Some(MoeTopology {
-        expert_count,
-        router_op_indices: router_indices,
-        expert_op_indices,
-        shared_op_indices,
-        router_output,
-        expert_input_names,
-        expert_output_names,
-    })
+    Some(build_topology(ops, router_indices, expert_op_indices))
 }
 
 // ---------------------------------------------------------------------------
@@ -631,30 +606,45 @@ fn detect_by_structure(
         .map(|&start| trace_expert_subgraph(start, ops, consumer_map))
         .collect();
 
-    let expert_count = expert_op_indices.len();
-
-    let mut assigned: HashSet<usize> = router_set;
-    for group in &expert_op_indices {
-        assigned.extend(group);
-    }
-    let shared_op_indices: Vec<usize> = (0..ops.len()).filter(|i| !assigned.contains(i)).collect();
-
-    let (expert_input_names, expert_output_names) = compute_expert_io(ops, &expert_op_indices);
-
-    Some(MoeTopology {
-        expert_count,
-        router_op_indices: router.op_indices,
-        expert_op_indices,
-        shared_op_indices,
-        router_output: router.output_name,
-        expert_input_names,
-        expert_output_names,
-    })
+    Some(build_topology(ops, router.op_indices, expert_op_indices))
 }
 
 // ---------------------------------------------------------------------------
 // Graph analysis helpers
 // ---------------------------------------------------------------------------
+
+/// Assemble a `MoeTopology` from router/expert indices and operations.
+fn build_topology(
+    ops: &[Operation],
+    router_op_indices: Vec<usize>,
+    expert_op_indices: Vec<Vec<usize>>,
+) -> MoeTopology {
+    let expert_count = expert_op_indices.len();
+
+    let mut assigned: HashSet<usize> = HashSet::new();
+    for group in &expert_op_indices {
+        assigned.extend(group);
+    }
+    assigned.extend(&router_op_indices);
+    let shared_op_indices: Vec<usize> = (0..ops.len()).filter(|i| !assigned.contains(i)).collect();
+
+    let router_output = router_op_indices
+        .last()
+        .and_then(|&i| ops[i].outputs.first().cloned())
+        .unwrap_or_default();
+
+    let (expert_input_names, expert_output_names) = compute_expert_io(ops, &expert_op_indices);
+
+    MoeTopology {
+        expert_count,
+        router_op_indices,
+        expert_op_indices,
+        shared_op_indices,
+        router_output,
+        expert_input_names,
+        expert_output_names,
+    }
+}
 
 /// Map each output name to the index of the op that produces it.
 fn build_output_map(ops: &[Operation]) -> HashMap<String, usize> {
@@ -705,10 +695,8 @@ fn find_router_pattern(
             if let Some(&pred_idx) = output_map.get(&ref_name) {
                 let pred = &ops[pred_idx];
                 if pred.op_type == "linear" || pred.op_type == "matmul" {
-                    let output_name = op.outputs.first()?.clone();
                     return Some(RouterInfo {
                         op_indices: vec![pred_idx, i],
-                        output_name,
                     });
                 }
             }
@@ -729,10 +717,8 @@ fn find_router_pattern(
                     if let Some(&gate_idx) = output_map.get(&sr) {
                         let gate = &ops[gate_idx];
                         if gate.op_type == "linear" || gate.op_type == "matmul" {
-                            let output_name = op.outputs.first()?.clone();
                             return Some(RouterInfo {
                                 op_indices: vec![gate_idx, softmax_idx, i],
-                                output_name,
                             });
                         }
                     }

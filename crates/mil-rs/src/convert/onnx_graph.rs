@@ -799,41 +799,38 @@ fn infer_reshape_output(
     Some(in_tt.clone())
 }
 
+/// Build a MIL `const` operation from raw tensor data.
+fn build_const_op(
+    name: &str,
+    raw_bytes: Vec<u8>,
+    shape: Vec<usize>,
+    dtype: ScalarType,
+) -> Operation {
+    let (narrowed_bytes, actual_dtype) = narrow_int64(raw_bytes, dtype);
+    let mut op = Operation::new("const", name);
+    op = op.with_output(name);
+    op.attributes
+        .insert("onnx_name".into(), Value::String(name.to_string()));
+    op.attributes.insert(
+        "val".into(),
+        Value::Tensor {
+            data: TensorData::Inline(narrowed_bytes),
+            shape,
+            dtype: actual_dtype,
+        },
+    );
+    op
+}
+
 /// Convert an ONNX [`TensorProto`] (initializer/weight) to a MIL `const` [`Operation`].
 ///
 /// CoreML MIL does not support int64 tensors in most operations, so int64
 /// initializers are automatically narrowed to int32.
 fn initializer_to_const(tensor: &TensorProto, model_dir: Option<&Path>) -> Result<Operation> {
-    let mut dtype = onnx_dtype_to_scalar(tensor.data_type)?;
+    let dtype = onnx_dtype_to_scalar(tensor.data_type)?;
     let shape: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-
-    let mut raw_bytes = extract_tensor_raw_data(tensor, dtype, model_dir);
-
-    // Narrow int64 → int32 for CoreML compatibility.
-    if dtype == ScalarType::Int64 {
-        raw_bytes = raw_bytes
-            .chunks_exact(8)
-            .flat_map(|c| {
-                let v = i64::from_le_bytes(c.try_into().unwrap());
-                (v as i32).to_le_bytes()
-            })
-            .collect();
-        dtype = ScalarType::Int32;
-    }
-
-    let mut op = Operation::new("const", &tensor.name);
-    op = op.with_output(&tensor.name);
-    op.attributes
-        .insert("onnx_name".into(), Value::String(tensor.name.clone()));
-    op.attributes.insert(
-        "val".into(),
-        Value::Tensor {
-            data: TensorData::Inline(raw_bytes),
-            shape: shape.clone(),
-            dtype,
-        },
-    );
-    Ok(op)
+    let raw_bytes = extract_tensor_raw_data(tensor, dtype, model_dir);
+    Ok(build_const_op(&tensor.name, raw_bytes, shape, dtype))
 }
 
 /// Extract raw bytes from an ONNX [`TensorProto`].
@@ -1222,37 +1219,14 @@ fn prequantized_to_op(
     init_data: &mut HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)>,
 ) -> Result<Operation> {
     // Build the primary const op from init_data (move, not clone).
-    let (mut raw_bytes, shape, mut dtype) = init_data.remove(&tensor.name).ok_or_else(|| {
+    let (raw_bytes, shape, dtype) = init_data.remove(&tensor.name).ok_or_else(|| {
         MilError::UnsupportedOp(format!(
             "no extracted data for pre-quantized tensor '{}'",
             tensor.name
         ))
     })?;
 
-    // Narrow int64 → int32 for CoreML compatibility.
-    if dtype == ScalarType::Int64 {
-        raw_bytes = raw_bytes
-            .chunks_exact(8)
-            .flat_map(|c| {
-                let v = i64::from_le_bytes(c.try_into().unwrap());
-                (v as i32).to_le_bytes()
-            })
-            .collect();
-        dtype = ScalarType::Int32;
-    }
-
-    let mut op = Operation::new("const", &tensor.name);
-    op = op.with_output(&tensor.name);
-    op.attributes
-        .insert("onnx_name".into(), Value::String(tensor.name.clone()));
-    op.attributes.insert(
-        "val".into(),
-        Value::Tensor {
-            data: TensorData::Inline(raw_bytes),
-            shape,
-            dtype,
-        },
-    );
+    let mut op = build_const_op(&tensor.name, raw_bytes, shape, dtype);
 
     let fmt_str = match fmt {
         PreQuantFormat::QLoRA => "qlora",
