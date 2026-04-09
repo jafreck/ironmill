@@ -16,23 +16,16 @@ kernel void superblock_matvec_int4(
     device half *C                  [[buffer(2)]],   // [1, N]
     constant uint &N                [[buffer(3)]],
     constant uint &K                [[buffer(4)]],
-    constant uint &group_size       [[buffer(5)]],
-    device const half *awq_scales   [[buffer(6)]],   // [K] or dummy
-    constant uint &has_awq          [[buffer(7)]],
+    device const half *awq_scales   [[buffer(5)]],   // [K] or dummy
+    constant uint &has_awq          [[buffer(6)]],
     uint tgid  [[threadgroup_position_in_grid]],
     uint sgid  [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]])
 {
     uint base_row = tgid * SB_ROWS_PER_TG + sgid * SB_ROWS_PER_SG;
 
-    uint num_groups = K / group_size;
-    uint sb_bytes = SB_HEADER_BYTES + group_size / 2;
-    uint sb_stride = num_groups * sb_bytes;
-
-    // Precompute power-of-2 shift for bitwise division/modulo
-    uint gs_shift = 0;
-    { uint tmp = group_size; while (tmp > 1) { tmp >>= 1; gs_shift++; } }
-    uint gs_mask = group_size - 1;
+    uint num_groups = K / GS;
+    uint sb_stride = num_groups * SB_BYTES_INT4;
 
     float result[SB_ROWS_PER_SG] = {0};
 
@@ -41,8 +34,8 @@ kernel void superblock_matvec_int4(
     for (uint w = lane; w < k_words; w += 32) {
         uint k_elem = w * 8;
 
-        uint g = k_elem >> gs_shift;
-        uint word_in_data = (k_elem & gs_mask) >> 3;
+        uint g = k_elem / GS;
+        uint word_in_data = (k_elem % GS) / 8;
 
         // Load 8 input values (shared across all rows)
         float a0 = float(A[k_elem]);
@@ -69,7 +62,7 @@ kernel void superblock_matvec_int4(
             uint row = base_row + r;
             if (row >= N) break;
 
-            device const uchar *sb = W + row * sb_stride + g * sb_bytes;
+            device const uchar *sb = W + row * sb_stride + g * SB_BYTES_INT4;
             float scale = float(*(device const half *)(sb));
             float zero  = float(*(device const half *)(sb + 2));
 
@@ -113,18 +106,16 @@ kernel void superblock_matvec_int8(
     device half *C                  [[buffer(2)]],
     constant uint &N                [[buffer(3)]],
     constant uint &K                [[buffer(4)]],
-    constant uint &group_size       [[buffer(5)]],
-    device const half *awq_scales   [[buffer(6)]],
-    constant uint &has_awq          [[buffer(7)]],
+    device const half *awq_scales   [[buffer(5)]],
+    constant uint &has_awq          [[buffer(6)]],
     uint tgid  [[threadgroup_position_in_grid]],
     uint sgid  [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]])
 {
     uint base_row = tgid * SB_ROWS_PER_TG + sgid * SB_ROWS_PER_SG;
 
-    uint num_groups = K / group_size;
-    uint sb_bytes = SB_HEADER_BYTES + group_size;  // INT8: 1 byte per element
-    uint sb_stride = num_groups * sb_bytes;
+    uint num_groups = K / GS;
+    uint sb_stride = num_groups * SB_BYTES_INT8;
 
     float result[SB_ROWS_PER_SG] = {0};
 
@@ -133,8 +124,8 @@ kernel void superblock_matvec_int8(
 
     for (uint w = lane; w < k_words; w += 32) {
         uint k_elem = w * 4;
-        uint g = k_elem / group_size;
-        uint k_in_group = k_elem % group_size;
+        uint g = k_elem / GS;
+        uint k_in_group = k_elem % GS;
         uint word_in_data = k_in_group / 4;
 
         float a0 = float(A[k_elem]);
@@ -153,7 +144,7 @@ kernel void superblock_matvec_int8(
             uint row = base_row + r;
             if (row >= N) break;
 
-            device const uchar *sb = W + row * sb_stride + g * sb_bytes;
+            device const uchar *sb = W + row * sb_stride + g * SB_BYTES_INT8;
             float scale = float(*(device const half *)(sb));
             float zero  = float(*(device const half *)(sb + 2));
 

@@ -91,32 +91,73 @@ fn main() {
         compile_shader(&src, &lib, &[], &shader_include_dir);
     }
 
-    // ── Affine matmul: concatenate common + split files into one metallib ──
+    // ── Affine matmul: AMX kernels only (no GS) ──
     {
         let quantized_dir = shader_dir.join("quantized");
         let affine_common =
             std::fs::read_to_string(quantized_dir.join("affine_common.metal")).unwrap();
-        let affine_parts = [
-            "affine_matmul",
-            "affine_matvec",
-            "affine_batched",
-            "affine_amx",
-            "affine_fused",
-        ];
-        let mut combined = affine_common;
-        for part in &affine_parts {
-            let src = std::fs::read_to_string(quantized_dir.join(format!("{part}.metal"))).unwrap();
-            combined.push('\n');
-            combined.push_str(&src);
-        }
-        let affine_tmp = out_dir.join("_affine_combined.metal");
-        std::fs::write(&affine_tmp, &combined).unwrap();
+        let amx_src = std::fs::read_to_string(quantized_dir.join("affine_amx.metal")).unwrap();
+        let combined = format!("{affine_common}\n{amx_src}");
+        let tmp = out_dir.join("_affine_amx.metal");
+        std::fs::write(&tmp, &combined).unwrap();
         compile_shader(
-            &affine_tmp,
+            &tmp,
             &out_dir.join("affine_matmul.metallib"),
             &[],
             &shader_include_dir,
         );
+    }
+
+    // ── Superblock kernels: compile per group_size ──
+    {
+        let quantized_dir = shader_dir.join("quantized");
+        let sb_header =
+            std::fs::read_to_string(quantized_dir.join("superblock_header.metal")).unwrap();
+        let sb_parts = [
+            "affine_matvec",
+            "affine_matmul",
+            "affine_batched",
+            "affine_fused",
+        ];
+        let mut sb_body = String::new();
+        for part in &sb_parts {
+            let src = std::fs::read_to_string(quantized_dir.join(format!("{part}.metal"))).unwrap();
+            sb_body.push('\n');
+            sb_body.push_str(&src);
+        }
+
+        for gs in [32u32, 64, 128, 256] {
+            let define = format!("#define GS {gs}\n");
+            let combined = format!("{define}{sb_header}\n{sb_body}");
+            let tmp = out_dir.join(format!("_superblock_gs{gs}.metal"));
+            std::fs::write(&tmp, &combined).unwrap();
+            compile_shader(
+                &tmp,
+                &out_dir.join(format!("superblock_gs{gs}.metallib")),
+                &[],
+                &shader_include_dir,
+            );
+        }
+    }
+
+    // ── Superblock fused norm: compile per group_size ──
+    {
+        let norm_dir = shader_dir.join("norm");
+        let sb_norm_src =
+            std::fs::read_to_string(norm_dir.join("superblock_fused_norm.metal")).unwrap();
+
+        for gs in [32u32, 64, 128, 256] {
+            let define = format!("#define GS {gs}\n");
+            let combined = format!("{define}{sb_norm_src}");
+            let tmp = out_dir.join(format!("_sb_norm_gs{gs}.metal"));
+            std::fs::write(&tmp, &combined).unwrap();
+            compile_shader(
+                &tmp,
+                &out_dir.join(format!("sb_norm_gs{gs}.metallib")),
+                &[],
+                &shader_include_dir,
+            );
+        }
     }
 
     // ── HEAD_DIM-dependent shaders (per-variant) ────────────────

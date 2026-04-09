@@ -125,7 +125,11 @@ pub(crate) fn encode_projection_q8(
                 if kernel_kind.is_decode() && aq.bit_width == 4 && aq.awq_scales.is_none() {
                     ops::encode_affine_matvec_int4xq8(
                         enc,
-                        &pipelines.affine.matvec_int4xq8,
+                        pipelines
+                            .affine
+                            .matvec_int4xq8
+                            .get(aq.group_size)
+                            .expect("unsupported group_size for matvec_int4xq8"),
                         q8_input.data,
                         q8_input.scales,
                         aq,
@@ -233,7 +237,7 @@ fn encode_affine_projection(
 
     // Use superblock pipeline for INT4 (handles both decode and prefill)
     let pipeline = pipelines
-        .affine_pipeline(weight.bit_width.into(), kind)
+        .affine_pipeline(weight.bit_width.into(), kind, weight.group_size)
         .ok_or_else(|| {
             InferenceError::runtime(format!(
                 "unsupported affine bit_width: {}",
@@ -249,15 +253,14 @@ fn encode_affine_projection(
         encoder.set_buffer(output, 0, 2);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 3);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 4);
-        encoder.set_bytes(&weight.group_size.to_le_bytes(), 5);
-        // AWQ scales: buffer 6 = scales data, buffer 7 = has_awq flag
+        // AWQ scales: buffer 5 = scales data, buffer 6 = has_awq flag
         let has_awq: u32 = if weight.awq_scales.is_some() { 1 } else { 0 };
         if let Some(ref awq_buf) = weight.awq_scales {
-            encoder.set_buffer(awq_buf, 0, 6);
+            encoder.set_buffer(awq_buf, 0, 5);
         } else {
-            encoder.set_buffer(&weight.data, 0, 6); // dummy
+            encoder.set_buffer(&weight.data, 0, 5); // dummy
         }
-        encoder.set_bytes(&has_awq.to_le_bytes(), 7);
+        encoder.set_bytes(&has_awq.to_le_bytes(), 6);
         // matvec_int4: ceil(N/8) TGs × 64 threads (8 rows per TG)
         encoder.dispatch_threadgroups((n.div_ceil(8), 1, 1), (64, 1, 1));
     } else {
@@ -265,14 +268,13 @@ fn encode_affine_projection(
         encoder.set_bytes(&(token_count as u32).to_le_bytes(), 3);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 4);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 5);
-        encoder.set_bytes(&weight.group_size.to_le_bytes(), 6);
         let has_awq: u32 = if weight.awq_scales.is_some() { 1 } else { 0 };
         if let Some(ref awq_buf) = weight.awq_scales {
-            encoder.set_buffer(awq_buf, 0, 7);
+            encoder.set_buffer(awq_buf, 0, 6);
         } else {
-            encoder.set_buffer(&weight.data, 0, 7); // dummy
+            encoder.set_buffer(&weight.data, 0, 6); // dummy
         }
-        encoder.set_bytes(&has_awq.to_le_bytes(), 8);
+        encoder.set_bytes(&has_awq.to_le_bytes(), 7);
         encoder.dispatch_threadgroups(
             (
                 token_count.div_ceil(MATMUL_TM_TILE),

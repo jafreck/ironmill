@@ -1,8 +1,23 @@
 //! Quantized matmul pipeline states and dispatch helpers.
 
+use std::collections::HashMap;
+
 use ironmill_metal_sys::{ComputeEncoder, ComputePipeline, MetalBuffer};
 
 use super::{LinearKernelKind, METAL_MAX_THREADS_PER_THREADGROUP};
+
+/// Pipelines specialized per group_size (32, 64, 128, 256).
+pub struct GroupSizePipelines {
+    /// Map from group_size to compiled pipeline.
+    pub variants: HashMap<u32, ComputePipeline>,
+}
+
+impl GroupSizePipelines {
+    /// Get the pipeline for a specific group_size, or `None` if unsupported.
+    pub fn get(&self, group_size: u32) -> Option<&ComputePipeline> {
+        self.variants.get(&group_size)
+    }
+}
 
 /// Affine quantized pipeline states.
 pub struct AffinePipelines {
@@ -12,37 +27,38 @@ pub struct AffinePipelines {
     pub matvec_int8_amx: ComputePipeline,
     /// INT4 affine embedding lookup with on-the-fly dequantization.
     pub embedding_lookup_int4: ComputePipeline,
-    /// INT4 matvec: 8 rows/TG, 64 threads, inline scale/zero.
-    pub matvec_int4: ComputePipeline,
-    /// INT4 matmul: tiled prefill with inline scale/zero.
-    pub matmul_int4: ComputePipeline,
-    /// Fused FFN gate+up+activation INT4.
-    pub fused_ffn_gate_up_act_int4: ComputePipeline,
-    /// Batched affine INT4 matvec (gate+up).
-    pub batched_matvec_int4: ComputePipeline,
-    /// GDN batched affine INT4 matvec (4 projections).
-    pub gdn_batched_matvec_int4: ComputePipeline,
-    /// INT4×Q8 integer dot product matvec.
-    pub matvec_int4xq8: ComputePipeline,
-    /// INT8 matvec: 8 rows/TG, 64 threads, inline scale/zero.
-    pub matvec_int8: ComputePipeline,
-    /// INT8 matmul: tiled prefill with inline scale/zero.
-    pub matmul_int8: ComputePipeline,
+    /// INT4 matvec per group_size variant.
+    pub matvec_int4: GroupSizePipelines,
+    /// INT4 matmul per group_size variant.
+    pub matmul_int4: GroupSizePipelines,
+    /// Fused FFN gate+up+activation INT4 per group_size variant.
+    pub fused_ffn_gate_up_act_int4: GroupSizePipelines,
+    /// Batched affine INT4 matvec (gate+up) per group_size variant.
+    pub batched_matvec_int4: GroupSizePipelines,
+    /// GDN batched affine INT4 matvec (4 projections) per group_size variant.
+    pub gdn_batched_matvec_int4: GroupSizePipelines,
+    /// INT4×Q8 integer dot product matvec per group_size variant.
+    pub matvec_int4xq8: GroupSizePipelines,
+    /// INT8 matvec per group_size variant.
+    pub matvec_int8: GroupSizePipelines,
+    /// INT8 matmul per group_size variant.
+    pub matmul_int8: GroupSizePipelines,
 }
 
 impl AffinePipelines {
-    /// Select the affine-quantized pipeline for a given bit-width and phase.
+    /// Select the affine-quantized pipeline for a given bit-width, group_size, and phase.
     #[inline]
-    pub fn for_bits_and_kind(
+    pub fn for_bits_kind_gs(
         &self,
         bit_width: u32,
         kind: LinearKernelKind,
+        group_size: u32,
     ) -> Option<&ComputePipeline> {
         match (bit_width, kind) {
-            (4, LinearKernelKind::Matvec) => Some(&self.matvec_int4),
-            (4, LinearKernelKind::Matmul) => Some(&self.matmul_int4),
-            (8, LinearKernelKind::Matvec) => Some(&self.matvec_int8),
-            (8, LinearKernelKind::Matmul) => Some(&self.matmul_int8),
+            (4, LinearKernelKind::Matvec) => self.matvec_int4.get(group_size),
+            (4, LinearKernelKind::Matmul) => self.matmul_int4.get(group_size),
+            (8, LinearKernelKind::Matvec) => self.matvec_int8.get(group_size),
+            (8, LinearKernelKind::Matmul) => self.matmul_int8.get(group_size),
             _ => None,
         }
     }
@@ -184,14 +200,13 @@ pub fn encode_batched_affine_matvec_int4(
     encoder.set_buffer(up_output, 0, 4);
     encoder.set_bytes(&n_gate.to_le_bytes(), 5);
     encoder.set_bytes(&k.to_le_bytes(), 6);
-    encoder.set_bytes(&gate_weight.group_size.to_le_bytes(), 7);
     // AWQ scales: use gate_weight's (shared between gate/up)
     if let Some(ref awq) = gate_weight.awq_scales {
-        encoder.set_buffer(awq, 0, 8);
-        encoder.set_bytes(&1u32.to_le_bytes(), 9);
+        encoder.set_buffer(awq, 0, 7);
+        encoder.set_bytes(&1u32.to_le_bytes(), 8);
     } else {
-        encoder.set_buffer(&gate_weight.data, 0, 8); // dummy
-        encoder.set_bytes(&0u32.to_le_bytes(), 9);
+        encoder.set_buffer(&gate_weight.data, 0, 7); // dummy
+        encoder.set_bytes(&0u32.to_le_bytes(), 8);
     }
     let tg_count = (2 * n_gate) as usize;
     encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
@@ -219,15 +234,14 @@ pub fn encode_fused_ffn_gate_up_act_int4(
     encoder.set_buffer(output, 0, 3);
     encoder.set_bytes(&n.to_le_bytes(), 4);
     encoder.set_bytes(&k.to_le_bytes(), 5);
-    encoder.set_bytes(&gate_weight.group_size.to_le_bytes(), 6);
     if let Some(ref awq) = gate_weight.awq_scales {
-        encoder.set_buffer(awq, 0, 7);
-        encoder.set_bytes(&1u32.to_le_bytes(), 8);
+        encoder.set_buffer(awq, 0, 6);
+        encoder.set_bytes(&1u32.to_le_bytes(), 7);
     } else {
-        encoder.set_buffer(&gate_weight.data, 0, 7); // dummy
-        encoder.set_bytes(&0u32.to_le_bytes(), 8);
+        encoder.set_buffer(&gate_weight.data, 0, 6); // dummy
+        encoder.set_bytes(&0u32.to_le_bytes(), 7);
     }
-    encoder.set_bytes(&(use_gelu as u32).to_le_bytes(), 9);
+    encoder.set_bytes(&(use_gelu as u32).to_le_bytes(), 8);
     encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }
 
@@ -250,14 +264,8 @@ pub(crate) fn encode_gdn_batched_affine_matvec_int4(
     encoder.set_buffer(&params.w3.data, 0, 7); // superblock
     encoder.set_buffer(params.out3, 0, 8);
     let has_awq = params.w0.awq_scales.is_some() as u32;
-    let params_words: [u32; 7] = [
-        params.n0,
-        params.n1,
-        params.n2,
-        params.n3,
-        params.k,
-        params.w0.group_size,
-        has_awq,
+    let params_words: [u32; 6] = [
+        params.n0, params.n1, params.n2, params.n3, params.k, has_awq,
     ];
     let params_bytes: Vec<u8> = params_words.iter().flat_map(|v| v.to_le_bytes()).collect();
     encoder.set_bytes(&params_bytes, 9);
@@ -316,7 +324,6 @@ pub fn encode_affine_matvec_int4xq8(
     encoder.set_buffer(output, 0, 3);
     encoder.set_bytes(&n.to_le_bytes(), 4);
     encoder.set_bytes(&k.to_le_bytes(), 5);
-    encoder.set_bytes(&weight.group_size.to_le_bytes(), 6);
-    encoder.set_bytes(&q8_group_size.to_le_bytes(), 7);
+    encoder.set_bytes(&q8_group_size.to_le_bytes(), 6);
     encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }

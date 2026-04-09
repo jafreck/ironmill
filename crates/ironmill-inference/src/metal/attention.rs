@@ -652,7 +652,8 @@ pub(crate) fn encode_end_of_layer_residual(
                     if aq.bit_width == 4 {
                         ops::encode_fused_residual_norm_affine_matvec_int4(
                             enc,
-                            &pipelines.fused.residual_norm_affine_matvec_int4,
+                            pipelines.fused.residual_norm_affine_matvec_int4.get(aq.group_size)
+                                .expect("unsupported group_size for fused_residual_norm_affine_matvec_int4"),
                             &ops::FusedResidualNormAffineInt4Params {
                                 a: &bufs.residual,
                                 b: &bufs.ffn_down,

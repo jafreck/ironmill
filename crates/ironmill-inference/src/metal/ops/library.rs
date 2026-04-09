@@ -19,6 +19,14 @@ pub(super) struct ShaderLibraries {
     pub tq: ShaderLibrary,
     pub sdpa: ShaderLibrary,
     pub fd: ShaderLibrary,
+    pub superblock_gs32: ShaderLibrary,
+    pub superblock_gs64: ShaderLibrary,
+    pub superblock_gs128: ShaderLibrary,
+    pub superblock_gs256: ShaderLibrary,
+    pub sb_norm_gs32: ShaderLibrary,
+    pub sb_norm_gs64: ShaderLibrary,
+    pub sb_norm_gs128: ShaderLibrary,
+    pub sb_norm_gs256: ShaderLibrary,
 }
 
 impl ShaderLibraries {
@@ -79,6 +87,54 @@ impl ShaderLibraries {
             tq,
             sdpa,
             fd,
+            superblock_gs32: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/superblock_gs32.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            superblock_gs64: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/superblock_gs64.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            superblock_gs128: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/superblock_gs128.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            superblock_gs256: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/superblock_gs256.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            sb_norm_gs32: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/sb_norm_gs32.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            sb_norm_gs64: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/sb_norm_gs64.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            sb_norm_gs128: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/sb_norm_gs128.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            sb_norm_gs256: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/sb_norm_gs256.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
         })
     }
 
@@ -243,6 +299,28 @@ impl ShaderLibraries {
                     .map_err(MetalError::Metal)?;
                 Ok((attn, tq, sdpa, fd))
             }
+        }
+    }
+
+    /// Get the superblock shader library for a given group_size.
+    pub fn superblock_lib(&self, group_size: u32) -> &ShaderLibrary {
+        match group_size {
+            32 => &self.superblock_gs32,
+            64 => &self.superblock_gs64,
+            128 => &self.superblock_gs128,
+            256 => &self.superblock_gs256,
+            _ => panic!("unsupported superblock group_size: {group_size}"),
+        }
+    }
+
+    /// Get the superblock fused norm library for a given group_size.
+    pub fn sb_norm_lib(&self, group_size: u32) -> &ShaderLibrary {
+        match group_size {
+            32 => &self.sb_norm_gs32,
+            64 => &self.sb_norm_gs64,
+            128 => &self.sb_norm_gs128,
+            256 => &self.sb_norm_gs256,
+            _ => panic!("unsupported sb_norm group_size: {group_size}"),
         }
     }
 }
