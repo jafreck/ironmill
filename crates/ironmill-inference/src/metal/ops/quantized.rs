@@ -37,6 +37,8 @@ pub struct AffinePipelines {
     pub batched_matvec_int4: GroupSizePipelines,
     /// GDN batched affine INT4 matvec (4 projections) per group_size variant.
     pub gdn_batched_matvec_int4: GroupSizePipelines,
+    /// Batched QKV affine INT4 matvec (3 projections, different N) per group_size variant.
+    pub batched_qkv_matvec_int4: GroupSizePipelines,
     /// INT4×Q8 integer dot product matvec per group_size variant.
     pub matvec_int4xq8: GroupSizePipelines,
     /// INT8 matvec per group_size variant.
@@ -229,6 +231,72 @@ pub fn encode_batched_affine_matvec_int4(
     encoder.set_buffer(up_weight.zeros.as_ref().unwrap(), 0, 12);
     let tg_count = (2 * n_gate) as usize;
     encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
+}
+
+/// Parameters for [`encode_batched_qkv_affine_matvec_int4`].
+pub struct QkvBatchedAffineInt4Params<'a> {
+    /// Shared input buffer.
+    pub input: &'a MetalBuffer,
+    /// Q projection weight.
+    pub w_q: &'a crate::metal::weights::AffineQuantizedWeight,
+    /// Q projection output buffer.
+    pub out_q: &'a MetalBuffer,
+    /// Q output dimension.
+    pub n_q: u32,
+    /// K projection weight.
+    pub w_k: &'a crate::metal::weights::AffineQuantizedWeight,
+    /// K projection output buffer.
+    pub out_k: &'a MetalBuffer,
+    /// K output dimension.
+    pub n_k: u32,
+    /// V projection weight.
+    pub w_v: &'a crate::metal::weights::AffineQuantizedWeight,
+    /// V projection output buffer.
+    pub out_v: &'a MetalBuffer,
+    /// V output dimension.
+    pub n_v: u32,
+    /// Input dimension (hidden size).
+    pub k: u32,
+}
+
+/// Encode batched affine INT4 matvec for Q/K/V projections in a single dispatch.
+///
+/// Computes Q = x·W_q^T, K = x·W_k^T, V = x·W_v^T concurrently.
+/// Supports GQA: N_k and N_v can differ from N_q.
+pub fn encode_batched_qkv_affine_matvec_int4(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    params: &QkvBatchedAffineInt4Params<'_>,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(params.input, 0, 0);
+    encoder.set_buffer(&params.w_q.data, 0, 1);
+    encoder.set_buffer(params.out_q, 0, 2);
+    encoder.set_buffer(&params.w_k.data, 0, 3);
+    encoder.set_buffer(params.out_k, 0, 4);
+    encoder.set_buffer(&params.w_v.data, 0, 5);
+    encoder.set_buffer(params.out_v, 0, 6);
+    let has_awq = params.w_q.awq_scales.is_some() as u32;
+    let params_words: [u32; 5] = [params.n_q, params.n_k, params.n_v, params.k, has_awq];
+    let params_bytes: Vec<u8> = params_words.iter().flat_map(|v| v.to_le_bytes()).collect();
+    encoder.set_bytes(&params_bytes, 7);
+    if let Some(ref awq) = params.w_q.awq_scales {
+        encoder.set_buffer(awq, 0, 8);
+    } else {
+        encoder.set_buffer(&params.w_q.data, 0, 8); // dummy
+    }
+    // Separate scale/zero arrays for Q, K, V
+    encoder.set_buffer(params.w_q.scales.as_ref().unwrap(), 0, 9);
+    encoder.set_buffer(params.w_q.zeros.as_ref().unwrap(), 0, 10);
+    encoder.set_buffer(params.w_k.scales.as_ref().unwrap(), 0, 11);
+    encoder.set_buffer(params.w_k.zeros.as_ref().unwrap(), 0, 12);
+    encoder.set_buffer(params.w_v.scales.as_ref().unwrap(), 0, 13);
+    encoder.set_buffer(params.w_v.zeros.as_ref().unwrap(), 0, 14);
+    // 8 rows per TG, 64 threads (same as regular matvec)
+    let tg_count = (params.n_q as usize).div_ceil(8)
+        + (params.n_k as usize).div_ceil(8)
+        + (params.n_v as usize).div_ceil(8);
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (64, 1, 1));
 }
 
 /// Encode fused FFN gate+up+activation for INT4 decode.

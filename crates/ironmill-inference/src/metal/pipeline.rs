@@ -591,54 +591,109 @@ impl MetalInference {
                     let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
                     let kv_out_features = layer_nkv as usize * layer_hd as usize;
 
-                    // Q8 input quantization for decode: quantize norm_out once,
-                    // reuse for all affine INT4 projections (Q, K, V, gate).
-                    let q8_input = if token_count == 1 {
-                        // Check if any projection uses affine INT4 (common case).
-                        let has_affine_int4 = matches!(&lw.q_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4)
-                            || matches!(&lw.k_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4);
-                        if has_affine_int4 {
-                            let pipelines_ref = self.pipelines()?;
-                            ops::encode_quantize_input_q8(
-                                &enc,
-                                &pipelines_ref.elementwise.quantize_input_q8,
-                                &bufs.norm_out,
-                                &bufs.q8_data,
-                                &bufs.q8_scales,
-                                h as u32,
-                                Q8_GROUP_SIZE as u32,
-                            );
-                            enc.memory_barrier_with_resources(&[&bufs.q8_data, &bufs.q8_scales]);
-                            Some(Q8Input {
-                                data: &bufs.q8_data,
-                                scales: &bufs.q8_scales,
-                            })
+                    // For decode, try batched QKV dispatch when all projections
+                    // are affine INT4 with the same group_size. This increases
+                    // total TG count (N_q+N_k+N_v) for better GPU occupancy.
+                    let used_batched_qkv = if token_count == 1 && !p1_skip {
+                        if let (
+                            WeightBuffer::AffineQuantized(aq_q),
+                            WeightBuffer::AffineQuantized(aq_k),
+                            WeightBuffer::AffineQuantized(aq_v),
+                        ) = (&lw.q_proj, &lw.k_proj, &lw.v_proj)
+                        {
+                            if aq_q.bit_width == 4
+                                && aq_k.bit_width == 4
+                                && aq_v.bit_width == 4
+                                && aq_q.group_size == aq_k.group_size
+                                && aq_q.group_size == aq_v.group_size
+                            {
+                                ops::encode_batched_qkv_affine_matvec_int4(
+                                    &enc,
+                                    pipelines
+                                        .affine
+                                        .batched_qkv_matvec_int4
+                                        .get(aq_q.group_size)
+                                        .expect(
+                                            "unsupported group_size for batched_qkv_matvec_int4",
+                                        ),
+                                    &ops::QkvBatchedAffineInt4Params {
+                                        input: &bufs.norm_out,
+                                        w_q: aq_q,
+                                        out_q: &bufs.q_proj,
+                                        n_q: qkv_out_features as u32,
+                                        w_k: aq_k,
+                                        out_k: &bufs.k_proj,
+                                        n_k: kv_out_features as u32,
+                                        w_v: aq_v,
+                                        out_v: &bufs.v_proj,
+                                        n_v: kv_out_features as u32,
+                                        k: h as u32,
+                                    },
+                                );
+                                true
+                            } else {
+                                false
+                            }
                         } else {
-                            None
+                            false
                         }
                     } else {
-                        None
+                        false
                     };
 
-                    // Build the projection list: skip Q if P1 fusion already computed it.
-                    let mut projections: Vec<(&WeightBuffer, &MetalBuffer, usize)> = Vec::new();
-                    if !p1_skip {
-                        projections.push((&lw.q_proj, &bufs.q_proj, qkv_out_features));
-                    }
-                    projections.push((&lw.k_proj, &bufs.k_proj, kv_out_features));
-                    projections.push((&lw.v_proj, &bufs.v_proj, kv_out_features));
-                    for (weight, output_buf, out_features) in &projections {
-                        encode_projection_q8(
-                            &enc,
-                            &bufs.norm_out,
-                            weight,
-                            output_buf,
-                            pipelines,
-                            token_count,
-                            *out_features,
-                            h,
-                            q8_input.as_ref(),
-                        )?;
+                    if !used_batched_qkv {
+                        // Q8 input quantization for decode: quantize norm_out once,
+                        // reuse for all affine INT4 projections (Q, K, V, gate).
+                        let q8_input = if token_count == 1 {
+                            // Check if any projection uses affine INT4 (common case).
+                            let has_affine_int4 = matches!(&lw.q_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4)
+                                || matches!(&lw.k_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4);
+                            if has_affine_int4 {
+                                let pipelines_ref = self.pipelines()?;
+                                ops::encode_quantize_input_q8(
+                                    &enc,
+                                    &pipelines_ref.elementwise.quantize_input_q8,
+                                    &bufs.norm_out,
+                                    &bufs.q8_data,
+                                    &bufs.q8_scales,
+                                    h as u32,
+                                    Q8_GROUP_SIZE as u32,
+                                );
+                                enc.memory_barrier_with_resources(&[
+                                    &bufs.q8_data,
+                                    &bufs.q8_scales,
+                                ]);
+                                Some(Q8Input {
+                                    data: &bufs.q8_data,
+                                    scales: &bufs.q8_scales,
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Build the projection list: skip Q if P1 fusion already computed it.
+                        let mut projections: Vec<(&WeightBuffer, &MetalBuffer, usize)> = Vec::new();
+                        if !p1_skip {
+                            projections.push((&lw.q_proj, &bufs.q_proj, qkv_out_features));
+                        }
+                        projections.push((&lw.k_proj, &bufs.k_proj, kv_out_features));
+                        projections.push((&lw.v_proj, &bufs.v_proj, kv_out_features));
+                        for (weight, output_buf, out_features) in &projections {
+                            encode_projection_q8(
+                                &enc,
+                                &bufs.norm_out,
+                                weight,
+                                output_buf,
+                                pipelines,
+                                token_count,
+                                *out_features,
+                                h,
+                                q8_input.as_ref(),
+                            )?;
+                        }
                     }
 
                     // Qwen3.5 attn_output_gate: dispatch gate projection alongside Q/K/V
@@ -646,7 +701,7 @@ impl MetalInference {
                     // The gate result is only consumed later by sigmoid_gate after attention,
                     // so no separate barrier is needed here.
                     if let (Some(gate_w), Some(gate_buf)) = (&lw.attn_output_gate, &bufs.q_gate) {
-                        encode_projection_q8(
+                        encode_projection(
                             &enc,
                             &bufs.norm_out,
                             gate_w,
@@ -655,7 +710,6 @@ impl MetalInference {
                             token_count,
                             qkv_out_features,
                             h,
-                            q8_input.as_ref(),
                         )?;
                     }
                     // Barrier for Q/K/V/gate projection outputs.

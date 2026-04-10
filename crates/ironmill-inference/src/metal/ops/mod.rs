@@ -76,6 +76,7 @@ type AdvancedMatmulShaders = (
     GroupSizePipelines,
     GroupSizePipelines,
     GroupSizePipelines,
+    GroupSizePipelines,
 );
 type FusedShaders = (
     ComputePipeline,
@@ -308,6 +309,7 @@ impl MetalPipelines {
             fused_ffn_gate_up_act_int4,
             batched_matvec_int4,
             gdn_batched_matvec_int4,
+            batched_qkv_matvec_int4,
             matvec_int4xq8,
             matvec_int8,
             matmul_int8,
@@ -371,6 +373,7 @@ impl MetalPipelines {
                 fused_ffn_gate_up_act_int4,
                 batched_matvec_int4,
                 gdn_batched_matvec_int4,
+                batched_qkv_matvec_int4,
                 matvec_int4xq8,
                 matvec_int8,
                 matmul_int8,
@@ -578,6 +581,12 @@ impl MetalPipelines {
                 device,
                 libs,
                 "superblock_gdn_batched_affine_matvec_int4",
+                |l, gs| l.superblock_lib(gs),
+            )?,
+            make_gs_pipelines(
+                device,
+                libs,
+                "superblock_batched_qkv_matvec_int4",
                 |l, gs| l.superblock_lib(gs),
             )?,
             make_gs_pipelines(device, libs, "superblock_affine_matvec_int4xq8", |l, gs| {

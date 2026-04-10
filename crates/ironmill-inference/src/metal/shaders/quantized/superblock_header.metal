@@ -42,3 +42,12 @@ struct GdnBatchedInt4Params {
     uint K;
     uint has_awq;
 };
+
+// ── QKV batched params struct ──
+struct QkvBatchedInt4Params {
+    uint N_q;
+    uint N_k;
+    uint N_v;
+    uint K;
+    uint has_awq;
+};
