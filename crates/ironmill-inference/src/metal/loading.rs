@@ -467,6 +467,13 @@ impl MetalInference {
             self.layer_plans.clone(),
         ));
 
+        // Build compile-time decode graph for barrier optimization.
+        let graph = super::graph::DecodeGraph::build(&self.layer_plans, &mc);
+        if self.config.kernel_timing {
+            graph.print_analysis();
+        }
+        self.decode_graph = Some(graph);
+
         self.seq_pos = 0;
         Ok(())
     }

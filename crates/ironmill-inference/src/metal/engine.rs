@@ -85,6 +85,8 @@ pub struct MetalInference {
     pub(crate) layer_plans: Vec<LayerPlan>,
     /// Model-level execution plan, resolved at load time.
     pub(crate) model_plan: Option<ModelPlan>,
+    /// Pre-compiled decode graph for barrier optimization.
+    pub(crate) decode_graph: Option<super::graph::DecodeGraph>,
     /// D2Quant Deviation-Aware Correction (DAC) per-layer bias vectors.
     /// Each buffer is `[hidden_size]` FP16. Added to post-attention LayerNorm
     /// output to compensate for quantization-induced mean shift.
@@ -155,6 +157,7 @@ impl MetalInference {
             gdn_state: None,
             layer_plans: Vec::new(),
             model_plan: None,
+            decode_graph: None,
             dac_biases: None,
             calib_scratch: None,
             gpu_max_threadgroups,

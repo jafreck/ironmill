@@ -370,6 +370,38 @@ implementing a lightweight graph-based dispatch model:
 **Prerequisite:** Investigation 4 must show measurable CPU-side or
 buffer-management overhead.
 
+**Result: Implemented. 33.1% barrier reduction. No measurable speed change.**
+
+Compile-time decode graph implemented in `graph.rs` with:
+- `DecodeGraph`: pre-compiled operation sequence from `LayerPlan`
+- `BarrierTracker`: runtime dirty-tracking that eliminates redundant barriers
+- Buffer lifetime analysis identifying aliasing opportunities
+
+Graph analysis for Qwen3.5-4B (24 GDN + 8 Standard layers):
+```
+Operations:            195
+Conservative barriers: 290
+Optimized barriers:    194 (96 eliminated, 33.1% reduction)
+Total barrier slots:   266
+```
+
+The barrier tracker skips barriers for buffers that haven't been written
+since their last barrier. Main savings come from:
+- `v_proj` in post-QK-norm barrier (8 Standard layers, no V-norm)
+- `q_gate` not needing barrier until sigmoid_gate
+- Various redundant re-barriers after fused operations
+
+Benchmark (5 runs): 43.1, 43.9, 42.7, 42.8, 42.5 tok/s (median 42.8).
+Baseline: 43.0 tok/s. **No measurable improvement (within noise).**
+
+This confirms Investigation 4's finding: in-encoder barrier overhead is
+near-zero on M2 Max. Even eliminating 33% of barriers (96 of 290) has
+no measurable GPU time impact. The graph infrastructure remains valuable
+as analysis tooling and documentation of the pipeline's data dependencies.
+
+**Files:** `crates/ironmill-inference/src/metal/graph.rs`,
+`crates/ironmill-inference/src/metal/pipeline.rs`
+
 ### Inline norm recomputation
 
 Eliminate the `norm_out` buffer entirely by having each projection
@@ -428,6 +460,10 @@ attempts (see `metal-lazy-eval-optimization.md`):
 - **Dead Q8 dispatch removal**: Removing wasted Q8 quantization on AWQ
   layers had no measurable impact (0% change). Confirms near-zero
   dispatch overhead. Fix applied anyway for code correctness.
+- **Graph-compiled barrier optimization**: Compile-time decode graph
+  eliminates 96 of 290 barriers (33.1% reduction) via dirty-tracking.
+  No measurable speed change — confirms barriers have near-zero cost
+  within a single Metal compute encoder on M2 Max.
 
 ## Confidence Summary
 

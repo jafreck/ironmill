@@ -15,6 +15,7 @@ use super::gdn::encode_gdn_decode;
 use super::gdn::encode_gdn_prefill;
 #[cfg(feature = "profile-metal")]
 use super::gdn::{encode_gdn_core_and_output, encode_gdn_projections};
+use super::graph::Buf;
 use super::ops;
 use super::plan::{AttentionKind, RopeTable};
 use super::ple;
@@ -367,6 +368,39 @@ impl MetalInference {
             None
         };
 
+        // Barrier tracker: for decode (token_count=1), use the graph-based
+        // tracker to compute minimum barriers from actual read/write deps.
+        // For prefill or profiling, barriers are placed manually as before.
+        #[cfg(feature = "profile-metal")]
+        let use_tracker = false; // profiling needs explicit barriers per category
+        #[cfg(not(feature = "profile-metal"))]
+        let use_tracker = token_count == 1 && self.decode_graph.is_some();
+        let mut bt = super::graph::BarrierTracker::new();
+
+        /// Optimized barrier: uses the tracker for decode, falls back to
+        /// explicit barrier for prefill/profiling.
+        macro_rules! opt_barrier {
+            ($enc:expr, $bufs:expr, [$($slot:expr),+ $(,)?]) => {{
+                if use_tracker {
+                    bt.barrier_for_reads($enc, &[$($slot),+], $bufs);
+                } else {
+                    let barrier_bufs: Vec<&MetalBuffer> = vec![
+                        $(super::graph::resolve_buf($slot, $bufs)),+
+                    ].into_iter().flatten().collect();
+                    if !barrier_bufs.is_empty() {
+                        $enc.memory_barrier_with_resources(&barrier_bufs);
+                    }
+                }
+            }};
+        }
+        macro_rules! opt_mark_writes {
+            ([$($slot:expr),+ $(,)?]) => {{
+                if use_tracker {
+                    bt.mark_writes(&[$($slot),+]);
+                }
+            }};
+        }
+
         /// End the current encoder + command buffer, record its GPU time under
         /// `$cat`, and create a fresh command buffer + encoder for the next
         /// category.
@@ -417,6 +451,7 @@ impl MetalInference {
                 let tg_x = h.min(256);
                 enc.dispatch_threads((h, token_count, 1), (tg_x, 1, 1));
                 enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
+                opt_mark_writes!([Buf::HiddenState]);
 
                 // Apply embed_scale in-place if needed (Gemma models only).
                 // TODO: add a scalar-immediate scale kernel for this path.
@@ -456,7 +491,8 @@ impl MetalInference {
                 enc.dispatch_threadgroups((token_count, 1, 1), (tg_size, 1, 1));
             }
         }
-        enc.memory_barrier_with_resources(&[&bufs.norm_out, &bufs.hidden_state]);
+        opt_mark_writes!([Buf::NormOut, Buf::HiddenState]);
+        opt_barrier!(&enc, bufs, [Buf::NormOut, Buf::HiddenState]);
 
         #[cfg(feature = "profile-metal")]
         if profiling {
@@ -573,11 +609,8 @@ impl MetalInference {
                             &enc, bufs, gdn, lw, pipelines, gdn_idx, h, eps, p1_skip,
                         )?;
                     }
-                    enc.memory_barrier_with_resources(&[
-                        &bufs.norm_out,
-                        &bufs.residual,
-                        &bufs.hidden_state,
-                    ]);
+                    opt_mark_writes!([Buf::NormOut, Buf::Residual, Buf::HiddenState]);
+                    opt_barrier!(&enc, bufs, [Buf::NormOut, Buf::Residual, Buf::HiddenState]);
                     #[cfg(feature = "profile-metal")]
                     if profiling {
                         // Record GDN core+output as "attn_gdn" category.
@@ -670,12 +703,11 @@ impl MetalInference {
                     }
                     // Barrier for Q/K/V/gate projection outputs.
                     {
-                        let mut barrier_bufs: Vec<&MetalBuffer> =
-                            vec![&bufs.q_proj, &bufs.k_proj, &bufs.v_proj];
-                        if let Some(ref gate_buf) = bufs.q_gate {
-                            barrier_bufs.push(gate_buf);
+                        opt_mark_writes!([Buf::QProj, Buf::KProj, Buf::VProj]);
+                        if bufs.q_gate.is_some() {
+                            opt_mark_writes!([Buf::QGate]);
                         }
-                        enc.memory_barrier_with_resources(&barrier_bufs);
+                        opt_barrier!(&enc, bufs, [Buf::QProj, Buf::KProj, Buf::VProj, Buf::QGate]);
                     }
 
                     #[cfg(feature = "profile-metal")]
@@ -729,8 +761,14 @@ impl MetalInference {
                             eps,
                         },
                     )?;
-                    // Barrier includes v_proj for KV cache (covers V-norm write if present).
-                    enc.memory_barrier_with_resources(&[&bufs.q_proj, &bufs.k_proj, &bufs.v_proj]);
+                    // Barrier: QK-norm wrote q_proj, k_proj in-place. V-norm
+                    // may have written v_proj. The tracker skips v_proj if
+                    // it wasn't written (no V-norm), saving a redundant barrier slot.
+                    opt_mark_writes!([Buf::QProj, Buf::KProj]);
+                    if *has_v_norm {
+                        opt_mark_writes!([Buf::VProj]);
+                    }
+                    opt_barrier!(&enc, bufs, [Buf::QProj, Buf::KProj, Buf::VProj]);
 
                     // Steps 7-8: KV cache write + attention
                     let attn_scale = plan.attn_scale;
@@ -758,7 +796,8 @@ impl MetalInference {
                             gpu_max_threadgroups: self.gpu_max_threadgroups,
                         },
                     )?;
-                    enc.memory_barrier_with_resources(&[&bufs.attn_out]);
+                    opt_mark_writes!([Buf::AttnOut]);
+                    opt_barrier!(&enc, bufs, [Buf::AttnOut]);
 
                     // Qwen3.5 attn_output_gate: apply sigmoid(gate) to attention output.
                     if *has_output_gate {
@@ -772,7 +811,8 @@ impl MetalInference {
                                 gate_buf,
                                 gate_size,
                             );
-                            enc.memory_barrier_with_resources(&[&bufs.attn_out]);
+                            opt_mark_writes!([Buf::AttnOut]);
+                            opt_barrier!(&enc, bufs, [Buf::AttnOut]);
                         }
                     }
 
@@ -793,7 +833,8 @@ impl MetalInference {
                         h,
                         attn_out_features,
                     )?;
-                    enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
+                    opt_mark_writes!([Buf::FfnDown]);
+                    opt_barrier!(&enc, bufs, [Buf::FfnDown]);
 
                     #[cfg(feature = "profile-metal")]
                     if profiling {
@@ -815,7 +856,8 @@ impl MetalInference {
                                 eps,
                             },
                         );
-                        enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
+                        opt_mark_writes!([Buf::FfnDown]);
+                        opt_barrier!(&enc, bufs, [Buf::FfnDown]);
 
                         ops::encode_residual_add(
                             &enc,
@@ -825,7 +867,8 @@ impl MetalInference {
                             &bufs.residual,
                             (token_count * h) as u32,
                         );
-                        enc.memory_barrier_with_resources(&[&bufs.residual]);
+                        opt_mark_writes!([Buf::Residual]);
+                        opt_barrier!(&enc, bufs, [Buf::Residual]);
 
                         ops::encode_rms_norm(
                             &enc,
@@ -839,7 +882,8 @@ impl MetalInference {
                                 eps,
                             },
                         );
-                        enc.memory_barrier_with_resources(&[&bufs.norm_out]);
+                        opt_mark_writes!([Buf::NormOut]);
+                        opt_barrier!(&enc, bufs, [Buf::NormOut]);
                     } else {
                         // Standard pre-norm transformer: fused residual + norm
                         ops::encode_fused_residual_rms_norm(
@@ -856,7 +900,8 @@ impl MetalInference {
                                 token_count: token_count as u32,
                             },
                         );
-                        enc.memory_barrier_with_resources(&[&bufs.norm_out, &bufs.residual]);
+                        opt_mark_writes!([Buf::NormOut, Buf::Residual]);
+                        opt_barrier!(&enc, bufs, [Buf::NormOut, Buf::Residual]);
                     }
                 } // end AttentionKind::Standard
             } // end match plan.attention
@@ -875,6 +920,7 @@ impl MetalInference {
                         (token_count * h) as u32,
                     );
                     enc.memory_barrier_with_resources(&[&bufs.norm_out]);
+                    opt_mark_writes!([Buf::NormOut]);
                 }
             }
 
@@ -903,7 +949,8 @@ impl MetalInference {
                 token_count,
                 use_gelu,
             )?;
-            enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
+            opt_mark_writes!([Buf::FfnGate, Buf::FfnDown]);
+            opt_barrier!(&enc, bufs, [Buf::FfnDown]);
 
             #[cfg(feature = "profile-metal")]
             if profiling {
@@ -942,6 +989,7 @@ impl MetalInference {
                     },
                 );
                 enc.memory_barrier_with_resources(&[&bufs.ffn_gate]);
+                opt_mark_writes!([Buf::FfnGate]);
                 ops::encode_copy_buffer(
                     &enc,
                     &pipelines.elementwise.copy_buffer,
@@ -950,6 +998,7 @@ impl MetalInference {
                     (token_count * h) as u32,
                 );
                 enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
+                opt_mark_writes!([Buf::FfnDown]);
             }
 
             // PLE per-layer: gate → GELU → multiply → project → norm → residual add.
@@ -991,6 +1040,7 @@ impl MetalInference {
                         (token_count * h) as u32,
                     );
                     enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
+                    opt_mark_writes!([Buf::HiddenState]);
                     ops::encode_scale_buffer(
                         &enc,
                         &pipelines.elementwise.scale_buffer,
@@ -999,6 +1049,7 @@ impl MetalInference {
                         (token_count * h) as u32,
                     );
                     enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
+                    opt_mark_writes!([Buf::HiddenState]);
                     if layer_idx + 1 < mc.num_hidden_layers {
                         let next_norm = &weights.layers[layer_idx + 1].input_norm;
                         ops::encode_rms_norm(
@@ -1075,6 +1126,7 @@ impl MetalInference {
                     skip_first_proj = fused;
                 }
                 enc.memory_barrier_with_resources(&[&bufs.hidden_state, &bufs.norm_out]);
+                opt_mark_writes!([Buf::HiddenState, Buf::NormOut]);
 
                 #[cfg(feature = "profile-metal")]
                 if profiling {
@@ -1102,6 +1154,7 @@ impl MetalInference {
             },
         );
         enc.memory_barrier_with_resources(&[&bufs.norm_out]);
+        opt_mark_writes!([Buf::NormOut]);
 
         // Step 18: LM head projection — dispatches through encode_projection
         // which handles Dense (packed blocked), D2Quant, affine INT4, etc.

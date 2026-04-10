@@ -13,6 +13,7 @@ pub(crate) mod engine;
 pub mod error;
 pub(crate) mod ffn;
 pub(crate) mod gdn;
+pub(crate) mod graph;
 pub(crate) mod inference;
 pub(crate) mod kv_cache;
 pub(crate) mod loading;
