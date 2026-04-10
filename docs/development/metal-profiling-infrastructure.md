@@ -180,54 +180,107 @@ These are the specific unknowns that blocked optimization progress:
 **Test:** kernel_bandwidth_bench with sweep-n at K=2560 using
 `superblock_matvec_int4`.
 
-If BW plateaus above N=4096, the issue is per-TG and kernel changes
-could help. If BW keeps climbing with N, the issue is total TG count
-and only dispatch-level changes (concatenating projections) would help.
+**Result — YES, strongly.** BW scales ~90× from N=128 to N=10240:
+
+| N     | GPU (µs) | BW (GB/s) | % peak |
+|-------|----------|-----------|--------|
+| 128   | 51.0     | 3.5       | 0.9%   |
+| 256   | 50.6     | 7.0       | 1.7%   |
+| 512   | 50.5     | 13.9      | 3.5%   |
+| 1024  | 51.5     | 27.2      | 6.8%   |
+| 2048  | 33.7     | 82.8      | 20.7%  |
+| 3072  | 21.5     | 194.8     | 48.7%  |
+| 4096  | 22.2     | 251.4     | 62.9%  |
+| 8192  | 40.7     | 274.5     | 68.6%  |
+| 10240 | 43.6     | 319.8     | 80.0%  |
+
+**Conclusion:** BW keeps climbing with N. The issue is total TG count —
+small-N projections (Q/K/V at N=2560) achieve only ~66 GB/s (17% of
+peak). Concatenating projections (larger effective N) is the primary
+optimization lever. GPU time is dominated by launch overhead at small N
+(~50µs floor up to N≈1024).
 
 ### Q2: Does projection bandwidth scale with K?
 
 **Test:** kernel_bandwidth_bench with sweep-k at N=4096.
 
-If BW is higher at K=9216 (FFN down's K), it explains why FFN is
-faster: the down projection benefits from large K, not just the fused
-gate+up. This would mean the per-row work hypothesis was correct.
+**Result — YES, also scales with K:**
+
+| K     | GPU (µs) | BW (GB/s) | % peak |
+|-------|----------|-----------|--------|
+| 128   | 17.4     | 16.5      | 4.1%   |
+| 256   | 17.8     | 31.9      | 8.0%   |
+| 512   | 23.0     | 48.9      | 12.2%  |
+| 1024  | 32.5     | 69.0      | 17.2%  |
+| 2560  | 29.8     | 187.7     | 46.9%  |
+| 4096  | 32.2     | 277.6     | 69.4%  |
+| 9216  | 65.2     | 307.9     | 77.0%  |
+
+**Conclusion:** K=9216 (FFN down's K) achieves 308 GB/s vs K=2560's
+188 GB/s. The FFN down projection benefits from large K, confirming the
+per-row work hypothesis — more work per TG at large K amortizes memory
+latency better.
 
 ### Q3: What is FFN gate+up bandwidth vs FFN down bandwidth?
 
-**Test:** Per-dispatch profiling within the FFN category.
+**Test:** Kernel comparison at Qwen3.5-4B dims (h=2560, inter=10240).
 
-If fused gate+up (N=9216, K=2560, 32 threads) achieves 300 GB/s and
-down (N=2560, K=9216, 64 threads) achieves 100 GB/s, then the fused
-kernel genuinely helps for large N. If both achieve ~192 GB/s, the
-factor is K, not fusion.
+| kernel                 | N     | K     | BW (GB/s) | % peak |
+|------------------------|-------|-------|-----------|--------|
+| matvec_int4 (Q/K/V)   | 2560  | 2560  | 66.3      | 16.6%  |
+| fused_ffn_gate_up_act  | 2560  | 2560  | 81.0      | 20.2%  |
+| batched_matvec_int4    | 2560  | 2560  | 85.1      | 21.3%  |
+| matvec (gate+up N)     | 10240 | 2560  | 322.0     | 80.5%  |
+| matvec (down N)        | 2560  | 10240 | 220.1     | 55.0%  |
+
+**Conclusion:** At the same N,K the fused/batched kernels give only
+modest BW improvement (81-85 vs 66 GB/s). The real FFN advantage comes
+from large N (gate+up at N=10240 → 322 GB/s) and large K (down at
+K=10240 → 220 GB/s). The fused kernel's benefit is amortizing input
+reads over 2 weight matrices, not fundamentally different memory access.
 
 ### Q4: Does GDN batched QKV (N=8192) have higher BW than Standard Q (N=4096)?
 
-**Test:** Per-dispatch profiling comparing GDN vs Standard layers.
+**Answer (from Q1 data):** Yes. At K=2560, N=8192 achieves 275 GB/s
+vs N=4096 at 251 GB/s (both using the basic matvec kernel). This
+confirms N is the dominant factor for this hardware — GDN's 4-way
+batched projection at N=8192 would achieve proportionally higher BW
+per-byte than Standard Q at N=4096.
 
-If GDN batched at N=8192 is proportionally faster per-byte, N is the
-dominant factor for this hardware.
+## Key Finding: The Bandwidth Bottleneck
 
-## Implementation Order
+**Projection bandwidth is low because N is small, not because of
+kernel inefficiency.** The M2 Max GPU needs N≥4096 to reach 50%+ of
+peak bandwidth. Typical Q/K/V projections (N=2560-4096) operate at
+17-25% of peak.
 
-1. **Kernel micro-benchmark** (Layer 1) — highest value, answers
-   Q1-Q2 directly, no pipeline changes needed.
-2. **Feature-gated profiler** (Layer 2) — replaces 21 inline sites,
-   decouples profiling from production.
-3. **Per-dispatch granularity** (Layer 3) — answers Q3-Q4, builds on
-   Layer 2.
-4. **Structured output** (Layer 4) — enables regression tracking,
-   builds on all layers.
+**Optimization implications:**
+1. **Concatenate Q/K/V projections** into a single larger dispatch
+   (effective N = 3× or 4×) to increase TG count and BW utilization.
+2. **FFN is already fast** because fused gate+up reads 2 matrices per
+   TG (effective N = 2×inter) and down has large K.
+3. **Kernel-level changes** (wider TGs, split-K) won't help because
+   the bottleneck is insufficient total TG count, not per-TG efficiency.
+4. **Hardware matters**: the ~50µs GPU launch overhead floor means very
+   small dispatches (N<1024) can never be fast regardless of kernel.
 
-## Cleanup: Remove Inline Profiling
+## Implementation Status
 
-Once Layer 2 is implemented, remove from `pipeline.rs`:
-- The `profiling` variable and `profile_boundary!` macro
-- All 11 `if profiling` blocks
-- The `wall_start` / `category_timings` variables
-- The P1 fusion disable (`!profiling &&` guard)
-- The GDN split path (`encode_gdn_projections` / `encode_gdn_core_and_output`)
-- The `kernel_timing`-gated eprintln block
+All 4 layers are implemented:
 
-This reduces `pipeline.rs` by ~100 lines and eliminates all profiling
-coupling from the production decode path.
+1. ✅ **Kernel micro-benchmark** — `examples/kernel_bandwidth_bench.rs`
+2. ✅ **Feature-gated profiler** — `profile-metal` feature,
+   `profiling.rs` module, 21 inline sites replaced with `#[cfg]`
+3. ✅ **Per-dispatch granularity** — `ProfilingGranularity::Dispatch`
+4. ✅ **Structured output** — JSON from both kernel bench and profiler
+
+## Cleanup Status
+
+Inline profiling has been replaced with `#[cfg(feature = "profile-metal")]`
+annotations. In production builds (without `profile-metal` feature):
+- The `profiling` variable, `profile_boundary!` macro, `category_timings`,
+  and `wall_start` do not exist
+- All 11 `if profiling` blocks are compiled out
+- The P1 fusion disable guard is always `true` (fusion enabled)
+- The GDN split path functions are compiled out
+- `pipeline.rs` has zero profiling overhead
