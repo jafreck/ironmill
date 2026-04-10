@@ -57,16 +57,19 @@ Any of these could dominate, and optimizing the wrong one wastes effort
 
 ### 1a. Per-category GPU timing — DONE
 
-**Implementation**: Added per-category command buffer profiling to
-`run_pipeline_inner`. When `kernel_timing` is enabled for decode
-(token_count == 1), the pipeline splits into separate command buffers
-at each operation category boundary. Each command buffer's
-`GPUStartTime`/`GPUEndTime` gives per-category GPU time.
+**Implementation**: Feature-gated profiling infrastructure (`profile-metal`
+feature) in `profiling.rs`. When enabled, the pipeline splits into separate
+command buffers at each operation category boundary. Each command buffer's
+`GPUStartTime`/`GPUEndTime` gives per-category GPU time. In production
+builds (without `profile-metal`), all profiling code is compiled out —
+zero branches, zero dead code.
+
+A standalone kernel micro-benchmark (`kernel_bandwidth_bench.rs`) was also
+added for isolated per-kernel bandwidth measurement with synthetic data.
+
+See `metal-profiling-infrastructure.md` for the full design and results.
 
 Categories: `embed`, `proj`, `attn`, `ffn`, `norm`, `lm_head`.
-
-Profiling mode disables P1 fusion and splits GDN encode into separate
-projection/core phases to ensure accurate per-category attribution.
 
 **Results** (Qwen3.5-4B INT4 AWQ gs=128, M2 Max 64 GB):
 
@@ -85,11 +88,10 @@ Note: Qwen3.5-4B has 24 GDN (linear_attention) + 8 Standard
 (full_attention) layers. "Attention" includes GDN recurrent kernel +
 O projection + residual+norm for GDN layers.
 
-### 1b. Memory bandwidth measurement — COMPUTED ANALYTICALLY
+### 1b. Memory bandwidth measurement — MEASURED VIA KERNEL MICRO-BENCHMARK
 
-MTLCounterSampleBuffer requires additional Metal API wrappers not yet
-in ironmill-metal-sys. Bandwidth was computed from profiled GPU time and
-known weight sizes.
+Kernel bandwidth was measured directly using `kernel_bandwidth_bench`
+(standalone binary, synthetic INT4 weights, per-kernel GPU timing).
 
 | Category | Weight bytes (32 layers) | GPU time | Effective BW | % of peak (400 GB/s) |
 |----------|--------------------------|----------|-------------|---------------------|
@@ -106,6 +108,27 @@ FFN achieves 48.0%. The 3.8× gap is because:
   of weight data per output row — too little work to keep the memory
   pipeline saturated.
 
+**Kernel micro-benchmark bandwidth sweep** (superblock_matvec_int4):
+
+| N | K=2560 BW (GB/s) | % peak |
+|------|-------------------|--------|
+| 128 | 3.5 | 0.9% |
+| 512 | 13.9 | 3.5% |
+| 1024 | 27.2 | 6.8% |
+| 2048 | 82.8 | 20.7% |
+| 4096 | 251.4 | 62.9% |
+| 8192 | 274.5 | 68.6% |
+| 10240 | 319.8 | 80.0% |
+
+BW scales strongly with N (90× from N=128 to N=10240). Similarly,
+BW scales with K (16.5 GB/s at K=128 → 308 GB/s at K=9216).
+
+**⚠ Critical caveat about micro-benchmarks**: These measurements use
+separate command buffers per dispatch (commit + wait). The ~50µs latency
+floor at small N is **command buffer submission overhead**, not kernel
+launch overhead. Within a single compute encoder (which the real pipeline
+uses), per-dispatch overhead is near-zero. See "Attempt 5" below.
+
 ### 1c. Dispatch overhead — MEASURED
 
 From profiling: Total GPU time = 22.24ms, baseline wall clock = 22.67ms.
@@ -115,6 +138,12 @@ From profiling: Total GPU time = 22.24ms, baseline wall clock = 22.67ms.
 The pipeline is NOT latency-bound. The ~283 dispatches per decode step
 add negligible overhead. Barriers and encoder switches are not the
 bottleneck.
+
+**In-encoder dispatch overhead is near-zero.** Per-category profiling
+(which commits/waits at category boundaries) adds ~26ms of overhead,
+confirming that command buffer submission is expensive but intra-encoder
+dispatch scheduling is free. This was further validated by the batched
+QKV experiment (see Attempt 6 below).
 
 ### 1d. MLX comparison profiling — SKIPPED
 
@@ -227,11 +256,24 @@ Five optimization approaches were tested and rejected:
    matvec at K=2560, the barrier/SRAM overhead dwarfs the AMX matmul
    throughput advantage. Only 64 TGs (vs 512 for scalar) further
    limits GPU occupancy.
+6. **Batched QKV projection (8-row kernel) — neutral.** Micro-benchmark
+   showed 1.6–3× speedup by computing Q+K+V in a single dispatch
+   (increasing total TG count from 320 to 480 at h=2560). End-to-end
+   decode was 43.0 tok/s in both cases. Two reasons:
+   (a) P1 fusion already computes Q in the fused residual+norm kernel,
+   so batched QKV only applies to layer 0.
+   (b) Even with P1 fusion disabled, the savings are invisible because
+   **per-dispatch overhead within a single compute encoder is near-zero**.
+   The micro-benchmark's commit/wait-per-dispatch pattern overstated
+   the overhead by 50µs per dispatch. The kernel was reverted.
 
 The key insight is that the FFN's 3.8× bandwidth advantage comes from
 having more total threadgroups (N=9216 vs N≤4096), not from its
 dual-stream structure. Projections with smaller N cannot sustain the
-same memory pressure.
+same memory pressure. However, **this is an inherent property of the
+single-encoder dispatch model**, not something that can be fixed by
+batching more dispatches together — the GPU already pipelines all
+dispatches within an encoder effectively.
 
 **Remaining optimization directions** (untested):
 1. **AMX-accelerated matvec**: The existing `affine_matvec_int4_amx`
@@ -283,6 +325,9 @@ better bandwidth through a mechanism not yet considered.
 
 ### Not recommended (tested and rejected)
 
+- **Batched QKV projection (8-row kernel)**: Neutral. Micro-benchmark
+  overstated dispatch overhead via commit/wait; real in-encoder overhead
+  is near-zero. P1 fusion already handles Q for layers 1+.
 - **Superblock AMX kernel**: 3× regression. Cooperative dequant + 40
   threadgroup barriers per dispatch overwhelms AMX matmul benefit
   for M=1 matvec at K=2560.
@@ -293,6 +338,9 @@ better bandwidth through a mechanism not yet considered.
 - **Split-K**: Already tested separately — GPU occupancy saturated.
 - **Barrier removal**: Overhead is only 1.9%.
 - **Q8 skip for AWQ**: Neutral.
+- **Reducing dispatch count**: In-encoder dispatch overhead is near-zero
+  on M2 Max. Batching dispatches to reduce launch count does not improve
+  decode tok/s.
 
 ---
 
@@ -320,10 +368,18 @@ matter most — which Phase 1 profiling will answer.
 
 ### Profiling infrastructure
 
-Run with `--kernel-timing` to see per-category GPU breakdown:
+Run per-category GPU breakdown with the `profile-metal` feature:
 ```bash
-cargo run --release -p ironmill-bench --features metal -- \
+cargo run --release -p ironmill-bench --features metal,profile-metal -- \
   --config configs/qwen35-4b-decode-perf.toml --kernel-timing --suite decode
+```
+
+Run kernel micro-benchmarks (no model needed):
+```bash
+cargo run --release -p ironmill-bench --features metal \
+  --example kernel_bandwidth_bench -- --compare-kernels --n 2560 --k 2560
+cargo run --release -p ironmill-bench --features metal \
+  --example kernel_bandwidth_bench -- --sweep-n 128,256,512,1024,2048,4096,8192 --k 2560
 ```
 
 ### Correctness
@@ -344,18 +400,21 @@ cargo run --release -p ironmill-bench --features metal -- \
 
 ### Performance
 
-No regression from profiling infrastructure (code gated behind
-`kernel_timing && token_count == 1`):
+No regression from profiling infrastructure (compiled out by default;
+requires `--features profile-metal` to enable):
 
 | Configuration | Decode (ms/tok) | tok/s | PPL |
 |---------------|-----------------|-------|-----|
 | Baseline | 22.67 | 44.1 | 9.42 |
 | After profiling infra | 22.77 | 43.9 | 9.42 |
+| After profiling refactor (profile-metal) | 23.16 | 43.2 | 9.42 |
 
 ---
 
 ## Related Documents
 
+- `metal-profiling-infrastructure.md` — Per-kernel profiling design,
+  benchmark results, and bandwidth scaling analysis (Q1-Q4 findings)
 - `archive/metal-split-k-optimization.md` — Split-K investigation (did
   not help; established that occupancy is not the bottleneck)
 - `archive/metal-bandwidth-optimization.md` — Previous optimization phases
