@@ -11,9 +11,10 @@ use super::attention::{
 use super::buffers::{ModelConfigExt, Q8_GROUP_SIZE, build_matmul_cache};
 use super::engine::MetalInference;
 use super::ffn::{encode_ffn_block, encode_moe_block};
-use super::gdn::{
-    encode_gdn_core_and_output, encode_gdn_decode, encode_gdn_prefill, encode_gdn_projections,
-};
+use super::gdn::encode_gdn_decode;
+use super::gdn::encode_gdn_prefill;
+#[cfg(feature = "profile-metal")]
+use super::gdn::{encode_gdn_core_and_output, encode_gdn_projections};
 use super::ops;
 use super::plan::{AttentionKind, RopeTable};
 use super::ple;
@@ -329,25 +330,39 @@ impl MetalInference {
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         // Create command buffer and single shared compute encoder.
+        // In profiling mode, these are reassigned at category boundaries.
+        #[cfg_attr(not(feature = "profile-metal"), allow(unused_mut))]
         let mut cmd_buf = self
             .queue
             .command_buffer()
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        #[cfg_attr(not(feature = "profile-metal"), allow(unused_mut))]
         let mut enc = cmd_buf
             .compute_encoder()
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
-        // Per-category GPU timing (Phase 1a profiling).
-        // When enabled, we split the pipeline into separate command buffers per
-        // operation category, committing and waiting at each boundary to collect
-        // per-category GPU time. This adds overhead but gives accurate breakdowns.
+        // Per-category GPU timing.
+        // When the `profile-metal` feature is enabled and kernel_timing is on,
+        // we split the pipeline into separate command buffers per operation
+        // category, committing and waiting at each boundary to collect per-
+        // category GPU time. This adds overhead but gives accurate breakdowns.
+        //
+        // When `profile-metal` is NOT enabled, all profiling code below is
+        // compiled out — zero branches, zero dead code in production.
+        #[cfg(feature = "profile-metal")]
         let profiling = self.config.kernel_timing && token_count == 1;
+        #[cfg(not(feature = "profile-metal"))]
+        let _profiling = false;
+
+        #[cfg(feature = "profile-metal")]
         let mut category_timings: Vec<(&str, f64)> = Vec::new();
+        #[cfg(feature = "profile-metal")]
         let wall_start = std::time::Instant::now();
 
         /// End the current encoder + command buffer, record its GPU time under
         /// `$cat`, and create a fresh command buffer + encoder for the next
         /// category.
+        #[cfg(feature = "profile-metal")]
         macro_rules! profile_boundary {
             ($queue:expr, $cmd:ident, $enc:ident, $timings:ident, $cat:expr) => {{
                 $enc.end_encoding();
@@ -435,6 +450,7 @@ impl MetalInference {
         }
         enc.memory_barrier_with_resources(&[&bufs.norm_out, &bufs.hidden_state]);
 
+        #[cfg(feature = "profile-metal")]
         if profiling {
             profile_boundary!(self.queue, cmd_buf, enc, category_timings, "embed");
         }
@@ -524,7 +540,9 @@ impl MetalInference {
                             h,
                             eps,
                         )?;
-                    } else if profiling {
+                    }
+                    #[cfg(feature = "profile-metal")]
+                    if token_count == 1 && profiling {
                         // Profiling: split GDN into projection + core phases
                         // for accurate per-category timing.
                         encode_gdn_projections(&enc, bufs, gdn, lw, pipelines, h, p1_skip)?;
@@ -534,7 +552,15 @@ impl MetalInference {
                         )?;
                         // GDN core includes: recurrent attn + O proj + residual+norm.
                         // Count it as "attn" since the recurrent kernel dominates.
-                    } else {
+                    }
+                    #[cfg(feature = "profile-metal")]
+                    if token_count == 1 && !profiling {
+                        encode_gdn_decode(
+                            &enc, bufs, gdn, lw, pipelines, gdn_idx, h, eps, p1_skip,
+                        )?;
+                    }
+                    #[cfg(not(feature = "profile-metal"))]
+                    if token_count == 1 {
                         encode_gdn_decode(
                             &enc, bufs, gdn, lw, pipelines, gdn_idx, h, eps, p1_skip,
                         )?;
@@ -544,6 +570,7 @@ impl MetalInference {
                         &bufs.residual,
                         &bufs.hidden_state,
                     ]);
+                    #[cfg(feature = "profile-metal")]
                     if profiling {
                         // Record GDN core+output as "attn" category.
                         profile_boundary!(self.queue, cmd_buf, enc, category_timings, "attn");
@@ -641,6 +668,7 @@ impl MetalInference {
                         enc.memory_barrier_with_resources(&barrier_bufs);
                     }
 
+                    #[cfg(feature = "profile-metal")]
                     if profiling {
                         profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj");
                     }
@@ -738,6 +766,7 @@ impl MetalInference {
                         }
                     }
 
+                    #[cfg(feature = "profile-metal")]
                     if profiling {
                         profile_boundary!(self.queue, cmd_buf, enc, category_timings, "attn");
                     }
@@ -756,6 +785,7 @@ impl MetalInference {
                     )?;
                     enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
 
+                    #[cfg(feature = "profile-metal")]
                     if profiling {
                         profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj");
                     }
@@ -846,6 +876,7 @@ impl MetalInference {
                 default_pipelines
             };
 
+            #[cfg(feature = "profile-metal")]
             if profiling {
                 profile_boundary!(self.queue, cmd_buf, enc, category_timings, "norm");
             }
@@ -864,6 +895,7 @@ impl MetalInference {
             )?;
             enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
 
+            #[cfg(feature = "profile-metal")]
             if profiling {
                 profile_boundary!(self.queue, cmd_buf, enc, category_timings, "ffn");
             }
@@ -983,7 +1015,11 @@ impl MetalInference {
 
                     // Determine next layer's first projection for P1 fusion.
                     // Disabled when profiling to get accurate per-category timing.
-                    let next_first_proj = if !profiling
+                    #[cfg(feature = "profile-metal")]
+                    let p1_fusion_allowed = !profiling;
+                    #[cfg(not(feature = "profile-metal"))]
+                    let p1_fusion_allowed = true;
+                    let next_first_proj = if p1_fusion_allowed
                         && token_count == 1
                         && layer_idx + 1 < mc.num_hidden_layers
                         && next_norm.is_some()
@@ -1030,12 +1066,14 @@ impl MetalInference {
                 }
                 enc.memory_barrier_with_resources(&[&bufs.hidden_state, &bufs.norm_out]);
 
+                #[cfg(feature = "profile-metal")]
                 if profiling {
                     profile_boundary!(self.queue, cmd_buf, enc, category_timings, "norm");
                 }
             }
         }
 
+        #[cfg(feature = "profile-metal")]
         if profiling && category_timings.last().map(|t| t.0) != Some("norm") {
             // Last layer's end-of-layer residual+norm is captured here.
             profile_boundary!(self.queue, cmd_buf, enc, category_timings, "norm");
@@ -1111,64 +1149,43 @@ impl MetalInference {
                 ));
             }
 
+            #[cfg(feature = "profile-metal")]
             if profiling {
                 // Record the final command buffer's GPU time (LM head).
                 let gpu_ms = (cmd_buf.gpu_end_time() - cmd_buf.gpu_start_time()) * 1000.0;
                 category_timings.push(("lm_head", gpu_ms));
                 let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
 
-                // Aggregate per-category totals.
-                let mut proj_ms = 0.0f64;
-                let mut attn_ms = 0.0f64;
-                let mut ffn_ms = 0.0f64;
-                let mut norm_ms = 0.0f64;
-                let mut embed_ms = 0.0f64;
-                let mut lm_head_ms = 0.0f64;
-                for &(cat, ms) in &category_timings {
-                    match cat {
-                        "proj" => proj_ms += ms,
-                        "attn" => attn_ms += ms,
-                        "ffn" => ffn_ms += ms,
-                        "norm" => norm_ms += ms,
-                        "embed" => embed_ms += ms,
-                        "lm_head" => lm_head_ms += ms,
-                        _ => {}
-                    }
-                }
-                let total_gpu_ms = proj_ms + attn_ms + ffn_ms + norm_ms + embed_ms + lm_head_ms;
-                let overhead_ms = wall_ms - total_gpu_ms;
+                // Build profiling report from category timings.
+                let records: Vec<super::profiling::TimingRecord> = category_timings
+                    .iter()
+                    .map(|&(cat, gpu_ms)| super::profiling::TimingRecord {
+                        category: cat,
+                        label: None,
+                        gpu_ms,
+                        bytes: None,
+                    })
+                    .collect();
+                let report = super::profiling::ProfilingReport { records, wall_ms };
+                report.print_table();
+            }
 
-                // Log the profiling breakdown.
-                eprintln!(
-                    "[kernel-timing] decode breakdown:\n\
-                     Projections (Q/K/V/O):  {:>6.2}ms  ({:>4.1}%)\n\
-                     FFN (gate+up+act+down): {:>6.2}ms  ({:>4.1}%)\n\
-                     Attention:              {:>6.2}ms  ({:>4.1}%)\n\
-                     Norms + residual:       {:>6.2}ms  ({:>4.1}%)\n\
-                     Embedding:              {:>6.2}ms  ({:>4.1}%)\n\
-                     LM head:                {:>6.2}ms  ({:>4.1}%)\n\
-                     ─────────────────────────────────\n\
-                     Total GPU:              {:>6.2}ms\n\
-                     Wall clock:             {:>6.2}ms\n\
-                     Overhead (idle/CPU):    {:>6.2}ms  ({:>4.1}%)",
-                    proj_ms,
-                    proj_ms / wall_ms * 100.0,
-                    ffn_ms,
-                    ffn_ms / wall_ms * 100.0,
-                    attn_ms,
-                    attn_ms / wall_ms * 100.0,
-                    norm_ms,
-                    norm_ms / wall_ms * 100.0,
-                    embed_ms,
-                    embed_ms / wall_ms * 100.0,
-                    lm_head_ms,
-                    lm_head_ms / wall_ms * 100.0,
-                    total_gpu_ms,
-                    wall_ms,
-                    overhead_ms,
-                    overhead_ms / wall_ms * 100.0,
+            #[cfg(feature = "profile-metal")]
+            if !profiling && self.config.kernel_timing {
+                let gpu_ms = (cmd_buf.gpu_end_time() - cmd_buf.gpu_start_time()) * 1000.0;
+                let mode = if token_count == 1 {
+                    "decode"
+                } else {
+                    "prefill"
+                };
+                tracing::info!(
+                    "[kernel-timing] {mode} tokens={token_count} gpu={gpu_ms:.3}ms layers={num_layers}",
+                    num_layers = mc.num_hidden_layers,
                 );
-            } else if self.config.kernel_timing {
+            }
+
+            #[cfg(not(feature = "profile-metal"))]
+            if self.config.kernel_timing {
                 // Non-profiling kernel_timing: just log total GPU time.
                 let gpu_ms = (cmd_buf.gpu_end_time() - cmd_buf.gpu_start_time()) * 1000.0;
                 let mode = if token_count == 1 {

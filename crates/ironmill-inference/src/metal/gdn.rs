@@ -354,6 +354,7 @@ pub(crate) fn encode_gdn_prefill(
 ///
 /// This is the first phase of GDN decode, split out to allow profiling
 /// boundaries between projection and recurrent phases.
+#[cfg(feature = "profile-metal")]
 pub(crate) fn encode_gdn_projections(
     enc: &ComputeEncoder,
     bufs: &IntermediateBuffers,
@@ -502,6 +503,7 @@ pub(crate) fn encode_gdn_projections(
 /// Encode GDN recurrent core + output projection + post-attention residual+norm.
 ///
 /// This is the second phase of GDN decode, after projections and their barrier.
+#[cfg(feature = "profile-metal")]
 pub(crate) fn encode_gdn_core_and_output(
     enc: &ComputeEncoder,
     bufs: &IntermediateBuffers,

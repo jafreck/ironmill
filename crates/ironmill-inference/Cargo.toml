@@ -27,6 +27,7 @@ tempfile = { workspace = true }
 [features]
 default = []
 metal = ["dep:ironmill-metal-sys"]
+profile-metal = ["metal"]
 ane = ["dep:ironmill-ane-sys", "dep:ironmill-iosurface"]
 coreml = ["dep:ironmill-coreml-sys"]
 async = ["dep:tokio"]

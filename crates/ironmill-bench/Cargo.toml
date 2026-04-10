@@ -49,6 +49,7 @@ harness = false
 default = []
 ane-direct = ["dep:ironmill-iosurface", "ironmill-inference/ane"]
 metal = ["ironmill-inference/metal"]
+profile-metal = ["ironmill-inference/profile-metal"]
 gptq = ["ironmill-compile/gptq"]
 
 [[example]]
@@ -74,4 +75,9 @@ required-features = ["metal"]
 [[example]]
 name = "awq_block_calibrate"
 path = "examples/awq_block_calibrate.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "kernel_bandwidth_bench"
+path = "examples/kernel_bandwidth_bench.rs"
 required-features = ["metal"]

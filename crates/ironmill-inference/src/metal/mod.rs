@@ -21,6 +21,8 @@ pub mod ops;
 pub(crate) mod pipeline;
 pub(crate) mod plan;
 pub(crate) mod ple;
+#[cfg(feature = "profile-metal")]
+pub mod profiling;
 pub(crate) mod projection;
 pub mod turboquant;
 pub mod weights;
