@@ -84,8 +84,41 @@ impl ProfilingReport {
         let overhead = self.wall_ms - total_gpu;
 
         eprintln!("[profile-metal] decode breakdown:");
+        // Compute per-layer-type totals for summary.
+        let mut proj_gdn_ms = 0.0_f64;
+        let mut attn_gdn_ms = 0.0_f64;
+        let mut proj_std_ms = 0.0_f64;
+        let mut attn_std_ms = 0.0_f64;
+        let mut gdn_count = 0_usize;
+        let mut std_count = 0_usize;
+        for (cat, ms) in &cats {
+            match *cat {
+                "proj_gdn" => proj_gdn_ms += ms,
+                "attn_gdn" => {
+                    attn_gdn_ms += ms;
+                    gdn_count = self
+                        .records
+                        .iter()
+                        .filter(|r| r.category == "attn_gdn")
+                        .count();
+                }
+                "proj_std" => proj_std_ms += ms,
+                "attn_std" => {
+                    attn_std_ms += ms;
+                    std_count = self
+                        .records
+                        .iter()
+                        .filter(|r| r.category == "attn_std")
+                        .count();
+                }
+                _ => {}
+            }
+        }
+        // Display categories — merge GDN/STD into combined totals and show per-layer-type detail.
         for (cat, ms) in &cats {
             let label = match *cat {
+                "proj_gdn" | "proj_std" => continue, // shown in summary below
+                "attn_gdn" | "attn_std" => continue, // shown in summary below
                 "proj" => "Projections (Q/K/V/O):",
                 "ffn" => "FFN (gate+up+act+down):",
                 "attn" => "Attention:",
@@ -95,11 +128,89 @@ impl ProfilingReport {
                 _ => cat,
             };
             eprintln!(
-                "  {:<26} {:>6.2}ms  ({:>4.1}%)",
+                "  {:<32} {:>6.2}ms  ({:>4.1}%)",
                 label,
                 ms,
                 ms / self.wall_ms * 100.0
             );
+        }
+        // Print GDN/Standard split if present.
+        let has_split = proj_gdn_ms > 0.0 || proj_std_ms > 0.0;
+        if has_split {
+            let total_proj = proj_gdn_ms + proj_std_ms;
+            let total_attn = attn_gdn_ms + attn_std_ms;
+            eprintln!(
+                "  {:<32} {:>6.2}ms  ({:>4.1}%)",
+                "Projections (total):",
+                total_proj,
+                total_proj / self.wall_ms * 100.0
+            );
+            if gdn_count > 0 {
+                eprintln!(
+                    "    {:<30} {:>6.2}ms  ({} GDN layers, {:.2}ms/layer)",
+                    "GDN projections:",
+                    proj_gdn_ms,
+                    gdn_count,
+                    proj_gdn_ms / gdn_count as f64
+                );
+            }
+            if std_count > 0 {
+                let std_proj_count = self
+                    .records
+                    .iter()
+                    .filter(|r| r.category == "proj_std")
+                    .count();
+                eprintln!(
+                    "    {:<30} {:>6.2}ms  ({} Std layers, {:.2}ms/layer)",
+                    "Std projections (QKV+O):",
+                    proj_std_ms,
+                    std_count,
+                    proj_std_ms / (std_count as f64)
+                );
+                // Standard layers have 2 proj records each (QKV + O-proj).
+                // Show per-phase split if we have enough records.
+                if std_proj_count == std_count * 2 {
+                    let std_proj_recs: Vec<f64> = self
+                        .records
+                        .iter()
+                        .filter(|r| r.category == "proj_std")
+                        .map(|r| r.gpu_ms)
+                        .collect();
+                    let qkv_total: f64 = std_proj_recs.iter().step_by(2).sum();
+                    let oproj_total: f64 = std_proj_recs.iter().skip(1).step_by(2).sum();
+                    eprintln!(
+                        "      QKV: {:.2}ms ({:.2}ms/layer)  O-proj: {:.2}ms ({:.2}ms/layer)",
+                        qkv_total,
+                        qkv_total / std_count as f64,
+                        oproj_total,
+                        oproj_total / std_count as f64,
+                    );
+                }
+            }
+            eprintln!(
+                "  {:<32} {:>6.2}ms  ({:>4.1}%)",
+                "Attention (total):",
+                total_attn,
+                total_attn / self.wall_ms * 100.0
+            );
+            if gdn_count > 0 {
+                eprintln!(
+                    "    {:<30} {:>6.2}ms  ({} GDN layers, {:.2}ms/layer)",
+                    "GDN recurrent+O+res+norm:",
+                    attn_gdn_ms,
+                    gdn_count,
+                    attn_gdn_ms / gdn_count as f64
+                );
+            }
+            if std_count > 0 {
+                eprintln!(
+                    "    {:<30} {:>6.2}ms  ({} Std layers, {:.2}ms/layer)",
+                    "Std attention:",
+                    attn_std_ms,
+                    std_count,
+                    attn_std_ms / std_count as f64
+                );
+            }
         }
         eprintln!("  ─────────────────────────────────");
         eprintln!("  Total GPU:              {:>6.2}ms", total_gpu);

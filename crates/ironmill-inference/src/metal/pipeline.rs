@@ -359,6 +359,14 @@ impl MetalInference {
         #[cfg(feature = "profile-metal")]
         let wall_start = std::time::Instant::now();
 
+        // Wall clock for CPU encoding overhead measurement (non-profiling path).
+        #[cfg_attr(feature = "profile-metal", allow(unused_variables))]
+        let encode_wall_start = if self.config.kernel_timing {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         /// End the current encoder + command buffer, record its GPU time under
         /// `$cat`, and create a fresh command buffer + encoder for the next
         /// category.
@@ -546,12 +554,12 @@ impl MetalInference {
                         // Profiling: split GDN into projection + core phases
                         // for accurate per-category timing.
                         encode_gdn_projections(&enc, bufs, gdn, lw, pipelines, h, p1_skip)?;
-                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj");
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj_gdn");
                         encode_gdn_core_and_output(
                             &enc, bufs, gdn, lw, pipelines, gdn_idx, h, eps,
                         )?;
                         // GDN core includes: recurrent attn + O proj + residual+norm.
-                        // Count it as "attn" since the recurrent kernel dominates.
+                        // Count it as "attn_gdn" since the recurrent kernel dominates.
                     }
                     #[cfg(feature = "profile-metal")]
                     if token_count == 1 && !profiling {
@@ -572,8 +580,8 @@ impl MetalInference {
                     ]);
                     #[cfg(feature = "profile-metal")]
                     if profiling {
-                        // Record GDN core+output as "attn" category.
-                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "attn");
+                        // Record GDN core+output as "attn_gdn" category.
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "attn_gdn");
                     }
                 }
                 AttentionKind::Standard {
@@ -593,11 +601,13 @@ impl MetalInference {
 
                     // Q8 input quantization for decode: quantize norm_out once,
                     // reuse for all affine INT4 projections (Q, K, V, gate).
+                    // Only useful when AWQ is NOT active — encode_projection_q8
+                    // ignores q8 data when awq_scales are present.
                     let q8_input = if token_count == 1 {
-                        // Check if any projection uses affine INT4 (common case).
-                        let has_affine_int4 = matches!(&lw.q_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4)
-                            || matches!(&lw.k_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4);
-                        if has_affine_int4 {
+                        // Check if any projection uses affine INT4 *without* AWQ.
+                        let has_non_awq_int4 = matches!(&lw.q_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4 && aq.awq_scales.is_none())
+                            || matches!(&lw.k_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4 && aq.awq_scales.is_none());
+                        if has_non_awq_int4 {
                             let pipelines_ref = self.pipelines()?;
                             ops::encode_quantize_input_q8(
                                 &enc,
@@ -670,7 +680,7 @@ impl MetalInference {
 
                     #[cfg(feature = "profile-metal")]
                     if profiling {
-                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj");
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj_std");
                     }
 
                     // Gemma 4 V-norm: scale-free RMSNorm on V projections.
@@ -768,7 +778,7 @@ impl MetalInference {
 
                     #[cfg(feature = "profile-metal")]
                     if profiling {
-                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "attn");
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "attn_std");
                     }
 
                     // Step 9: Output projection
@@ -787,7 +797,7 @@ impl MetalInference {
 
                     #[cfg(feature = "profile-metal")]
                     if profiling {
-                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj");
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj_std");
                     }
 
                     // Step 10-11: Residual add + post-attention RMSNorm
@@ -1186,16 +1196,20 @@ impl MetalInference {
 
             #[cfg(not(feature = "profile-metal"))]
             if self.config.kernel_timing {
-                // Non-profiling kernel_timing: just log total GPU time.
+                // Non-profiling kernel_timing: log total GPU time and CPU encoding overhead.
                 let gpu_ms = (cmd_buf.gpu_end_time() - cmd_buf.gpu_start_time()) * 1000.0;
+                let wall_ms = encode_wall_start
+                    .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                let cpu_ms = wall_ms - gpu_ms;
                 let mode = if token_count == 1 {
                     "decode"
                 } else {
                     "prefill"
                 };
-                tracing::info!(
-                    "[kernel-timing] {mode} tokens={token_count} gpu={gpu_ms:.3}ms layers={num_layers}",
-                    num_layers = mc.num_hidden_layers,
+                eprintln!(
+                    "[kernel-timing] {mode} tokens={token_count} gpu={gpu_ms:.3}ms wall={wall_ms:.3}ms cpu={cpu_ms:.3}ms layers={}",
+                    mc.num_hidden_layers,
                 );
             }
         }
