@@ -1,4 +1,4 @@
-# Closing the MLX Gap: Metal Decode Optimization Plan
+# Closing the MLX Gap: Investigation & Optimization Plan
 
 ## Current State
 
@@ -19,190 +19,248 @@ ironmill per-category GPU breakdown (22.2ms total):
 | Norms + residual | 0.35ms | 1.6% |
 | LM head | 0.90ms | 4.0% |
 
-## Gap Analysis
+**We do not have a per-category breakdown for MLX.** We cannot attribute
+the 14.5ms gap to specific categories without measuring MLX's GPU time
+per operation.
 
-MLX source analysis reveals their QMV kernel (`qmv_fast_impl`) uses the
-**identical architecture** to ironmill's `superblock_matvec_int4`: 64
-threads, 2 simdgroups, 4 rows/SG, same pre-scale trick. The 2.64× gap
-is **not in the kernel** — it's in the pipeline structure.
+## What We Know
 
-### What MLX does differently
+1. **The matvec kernels are identical.** MLX's `qmv_fast_impl` and
+   ironmill's `superblock_matvec_int4` use the same architecture: 64
+   threads, 2 simdgroups, 4 rows/SG, same pre-scale trick. The gap is
+   not in the hot kernel.
 
-1. **No GDN (linear attention) layers.** MLX's Qwen3.5-4B model uses
-   standard attention for all 32 layers. ironmill uses 24 GDN + 8
-   Standard. GDN involves a recurrent kernel + separate projection/core
-   phases that may be less efficient than flash attention for decode.
+2. **In-encoder dispatch overhead is near-zero.** Measured at 0.43ms
+   (1.9%). Reducing dispatch count does not help (validated by batched
+   QKV experiment — see `metal-lazy-eval-optimization.md`).
 
-2. **Flash-style fused attention.** MLX uses `steel_attention` (fused
-   Q·K^T → softmax → ·V in one kernel with FP16 KV cache). ironmill
-   uses TurboQuant INT8 KV cache with a separate attention kernel.
+3. **ironmill has more op fusion than MLX.** ironmill fuses
+   residual+norm, embedding+norm, gate+up+activation, and
+   norm+projection (P1). MLX does none of these fusions — it runs
+   residual add, RMSNorm, and projections as separate kernels.
 
-3. **Lazy eval command buffer batching.** MLX batches ~50 ops per
-   command buffer (configurable per hardware). ironmill uses one command
-   buffer per decode step. Both approaches show near-zero dispatch
-   overhead within an encoder, so this is likely not a significant
-   factor.
+## What We Don't Know
 
-4. **No dead dispatches.** MLX has no equivalent to ironmill's wasted
-   Q8 quantization dispatch on AWQ layers.
+These are open questions. Each must be answered by measurement, not
+assumption.
 
-### What MLX does NOT do (that ironmill does)
+- **Where does MLX spend its 8.8ms?** We have no per-category GPU
+  breakdown for MLX. The 14.5ms gap could be concentrated in one
+  category or spread across all of them.
 
-- MLX does **not** fuse residual+norm (separate kernels).
-- MLX does **not** fuse norm+projection (P1 fusion is ironmill-only).
-- MLX does **not** fuse across layers.
+- **Is GDN slower than standard attention for decode?** ironmill uses
+  24 GDN (linear attention) + 8 Standard layers. MLX uses 32 Standard
+  layers. GDN involves a recurrent kernel that may or may not be slower
+  than flash attention for single-token decode. We don't know.
 
-ironmill's existing fusions (P1, fused_residual_norm, fused_ffn,
-fused_embedding_norm) are more aggressive than MLX's. The gap must
-come from the items above — primarily attention and GDN.
+- **Does TurboQuant INT8 KV cache slow down attention?** ironmill
+  compresses KV cache to INT8 via TurboQuant, adding dequantization
+  overhead on every attention read. This saves memory but may cost
+  decode speed. We haven't measured attention with FP16 KV cache.
 
-## Optimization Plan
+- **Does MLX's lazy eval model provide a structural advantage?** MLX
+  batches operations and defers GPU submission via `eval()`. ironmill
+  eagerly encodes all dispatches into a single command buffer. Both
+  achieve near-zero dispatch overhead, but MLX's lazy eval may enable
+  framework-level optimizations (buffer reuse, allocation elision) that
+  we haven't quantified.
 
-### Priority 1: Eliminate dead Q8 dispatch
-**Expected savings: ~0.5ms (eliminating 8 wasted dispatches + barriers)**
+- **How much DRAM traffic goes to intermediate buffers?** Each decode
+  step writes and reads `norm_out`, `attn_out`, `ffn_gate`, `ffn_down`,
+  etc. We know the sizes but haven't measured the actual bandwidth cost
+  of these round-trips vs the weight-loading bottleneck.
 
-The Q8 input quantization runs on every Standard attention layer even
-though `encode_projection_q8` ignores the Q8 data when AWQ is active
-(`awq_scales.is_some()`). This wastes a dispatch + barrier per Standard
-layer.
+## Investigation Plan
 
-**Implementation:**
-- In `pipeline.rs`, skip Q8 quantization when all projections have AWQ
-  scales.
-- Minimal code change: add `&& !has_awq` to the Q8 dispatch condition.
+Each step is designed to answer a specific question with a measurable
+test. No implementation work until the investigation identifies where
+the gap actually is.
 
-**Files:** `crates/ironmill-inference/src/metal/pipeline.rs:596-621`
+### Investigation 1: GDN layer cost
+**Question:** Are GDN layers slower than Standard layers per-layer?
 
-### Priority 2: Profile GDN vs Standard attention cost
-**Expected savings: determines whether GDN is a bottleneck**
+**Test:** Use `profile-metal` per-dispatch granularity to measure
+per-layer GPU time. Compare:
+- Average GDN layer time (proj + recurrent + residual/norm)
+- Average Standard layer time (proj + attention + residual/norm)
 
-ironmill uses 24 GDN layers + 8 Standard layers. MLX uses 32 Standard
-layers with flash attention. The GDN recurrent kernel may be slower
-than flash attention for single-token decode.
+**Success criterion:** If GDN layers are >1.5× slower per-layer than
+Standard layers, GDN optimization (or replacement with standard
+attention) is a high-priority target.
 
-**Investigation:**
-- Use `profile-metal` per-dispatch mode to measure per-layer GPU time
-  for GDN vs Standard layers.
-- Compare: GDN layer time (proj + recurrent + output) vs Standard layer
-  time (proj + flash_attention + output).
-- If GDN layers are significantly slower, investigate whether the
-  Qwen3.5-4B model can use standard attention for all layers (the HF
-  config may not require GDN).
+**How to run:**
+```bash
+cargo run --release -p ironmill-bench --features metal,profile-metal -- \
+  --config configs/qwen35-4b-decode-perf.toml --kernel-timing --suite decode
+```
+The per-dispatch output labels each dispatch with its layer index and
+category.
 
 **Files:** `crates/ironmill-inference/src/metal/pipeline.rs:510-577`,
 `crates/ironmill-inference/src/metal/gdn.rs`
 
-### Priority 3: Flash attention for decode
-**Expected savings: potentially large (attention is 4.59ms = 21%)**
+### Investigation 2: TurboQuant KV cache overhead
+**Question:** How much decode time does TurboQuant INT8 KV cache cost
+vs FP16 KV cache?
 
-ironmill uses TurboQuant INT8 KV cache with a custom attention kernel.
-MLX uses FP16 KV cache with fused flash attention (`steel_attention`).
-The TurboQuant path involves dequantization overhead that may not pay
-off for the model sizes where ironmill operates.
+**Test:** Run the same decode benchmark with `kv_quant = "none"` (FP16
+KV cache) and compare tok/s. The config change is one line:
+```toml
+# In configs/qwen35-4b-decode-perf.toml:
+kv_quant = "none"   # was: kv_quant = "turbo-int8"
+```
 
-**Investigation:**
-- Benchmark decode with FP16 KV cache (disable `kv_quant = "turbo-int8"`)
-  to measure the raw attention kernel speed without TQ overhead.
-- If FP16 KV attention is significantly faster, evaluate the memory
-  tradeoff (2× KV cache size vs decode speed).
-- Consider implementing flash-decode for the FP16 path if it doesn't
-  exist.
+**Success criterion:** If FP16 KV cache is >10% faster on decode, the
+TurboQuant dequantization overhead is significant and worth optimizing
+or making configurable per model size.
 
-**Files:** `crates/ironmill-inference/src/metal/shaders/attention/`,
+**Caveats:** FP16 KV cache uses 2× memory. For Qwen3.5-4B at
+max_seq_len=512 this is small (~50MB → ~100MB), but for longer
+sequences or larger models it matters.
+
+**Files:** `configs/qwen35-4b-decode-perf.toml`,
 `crates/ironmill-inference/src/metal/shaders/turboquant/`
 
-### Priority 4: Fuse O-projection with post-attention norm
-**Expected savings: ~0.3ms (eliminate attn_out → ffn_down DRAM round-trip)**
+### Investigation 3: MLX per-category profiling
+**Question:** Where does MLX spend its 8.8ms per token?
+
+**Test:** Use Metal System Trace (Instruments.app) to capture MLX's GPU
+timeline during decode. This requires:
+1. Run `scripts/mlx_decode_bench.py --tokens 200` in background
+2. Attach Instruments with Metal System Trace template
+3. Capture ~5 seconds of decode
+4. In the GPU timeline, identify the repeating per-token pattern
+5. Measure time per kernel category (matmul, attention, elementwise)
+
+Alternatively, use the `--trace` flag with `MTL_CAPTURE_ENABLED=1`:
+```bash
+MTL_CAPTURE_ENABLED=1 python3 scripts/mlx_decode_bench.py --tokens 20 --trace
+open /tmp/mlx_trace.gputrace  # Opens in Instruments
+```
+
+**Success criterion:** Identify which category (projections, attention,
+FFN, or something else) accounts for the majority of MLX's time. This
+tells us where ironmill is losing.
+
+### Investigation 4: Lazy eval / graph-level optimization
+**Question:** Does MLX's lazy evaluation model provide a structural
+advantage beyond op fusion?
+
+MLX defers GPU work via `eval()`, batching operations into command
+buffers with a configurable threshold (~50 ops on M2 Max). This enables:
+- **Buffer reuse**: Temporary buffers can be recycled across operations
+  without CPU-side allocation
+- **Allocation elision**: Buffers that are immediately consumed can be
+  optimized away
+- **Execution reordering**: Independent operations can be submitted in
+  an optimal order
+
+ironmill eagerly encodes all dispatches into a single command buffer
+with pre-allocated intermediate buffers. We measured near-zero dispatch
+overhead (0.43ms), which suggests the command buffer model isn't the
+bottleneck. But lazy eval may provide wins we haven't measured.
+
+**Test:** This is harder to test in isolation. Two approaches:
+1. **Measure ironmill CPU-side encoding time**: Time the encode loop
+   (everything between creating the command buffer and calling
+   `commit()`). If encoding takes >1ms, lazy eval's deferred encoding
+   could help.
+2. **Measure buffer allocation overhead**: Profile `ironmill-bench`
+   with Instruments Time Profiler to see if buffer management or Metal
+   API calls take significant time outside the GPU.
+3. **Compare dispatch counts**: Count MLX dispatches per decode step
+   from the Metal System Trace (Investigation 3) vs ironmill's ~459
+   dispatches. If MLX has dramatically fewer dispatches, lazy eval's
+   fusion is eliminating work.
+
+**Success criterion:** If CPU-side overhead >2ms, or if MLX uses
+significantly fewer dispatches due to lazy fusion, lazy eval is worth
+investigating further.
+
+### Investigation 5: Eliminate dead Q8 dispatch
+**Question:** Does removing the wasted Q8 quantization dispatch on AWQ
+layers measurably improve decode?
+
+The Q8 input quantization runs on every Standard attention layer even
+though `encode_projection_q8` ignores the Q8 data when AWQ is active.
+This is 8 wasted dispatches + barriers.
+
+**Test:** Add `&& !has_awq` to the Q8 dispatch condition. Measure
+decode tok/s before and after.
+
+**Success criterion:** Any measurable improvement. Based on the batched
+QKV finding (in-encoder dispatch overhead is near-zero), this likely has
+negligible impact — but it's a trivial fix worth confirming.
+
+**Files:** `crates/ironmill-inference/src/metal/pipeline.rs:596-621`
+
+## Future Optimization Directions
+
+These should only be pursued **after** the investigations above identify
+the actual bottleneck. Impact estimates below are speculative until
+validated by measurement.
+
+### Op fusion: O-projection + residual + norm
 
 Current flow per layer:
 ```
-attention → write attn_out → barrier → O-proj reads attn_out, writes ffn_down
-  → barrier → fused_residual_norm reads ffn_down+hidden_state
+attention → write attn_out → barrier → O-proj reads attn_out, writes
+  ffn_down → barrier → fused_residual_norm reads ffn_down+hidden_state
 ```
 
-A fused `attention_output_and_residual_norm` kernel could:
-1. Read `attn_out` from the attention output
-2. Compute O-projection inline
-3. Add residual and compute RMSNorm
-4. Write `norm_out` and `residual` directly
+A fused kernel could eliminate the `attn_out` and `ffn_down` DRAM
+round-trips. The P1 kernel already demonstrates the norm+projection
+fusion pattern. This would be the reverse: projection+residual+norm.
 
-This eliminates the `attn_out` DRAM write (num_heads × head_dim × 2
-bytes per layer = 2560×2 = 5KB, but 32 layers × 2 accesses = 320KB
-total traffic eliminated).
+**Prerequisite:** Investigation 3 must show that projection time is a
+significant fraction of MLX's gap, not just ironmill's internal
+breakdown.
 
-**Prerequisite:** This requires the O-projection to be fused into the
-same kernel as the residual+norm. The P1 kernel already demonstrates
-this pattern (norm + projection). The new kernel would be O-proj +
-residual + norm.
+### Op fusion: FFN down-proj + residual + norm
 
-**Files:** `crates/ironmill-inference/src/metal/shaders/norm/superblock_fused_norm.metal`
+Same pattern: fuse the down-projection with the end-of-layer
+residual+norm to eliminate the `ffn_down` buffer write/read.
 
-### Priority 5: Fuse FFN down-projection with end-of-layer residual+norm
-**Expected savings: ~0.3ms (eliminate ffn_down DRAM round-trip)**
+**Prerequisite:** Same as above.
 
-Current flow:
-```
-fused_gate_up_act → write ffn_gate → barrier → down-proj reads ffn_gate,
-  writes ffn_down → barrier → P1 fused reads ffn_down+residual
-```
+### Lazy eval / graph compilation
 
-The `ffn_down` buffer is written by the down-projection and immediately
-read by the P1 fused kernel. A fused `down_proj_residual_norm` kernel
-could compute the down projection and immediately add residual + norm
-without the DRAM round-trip for `ffn_down`.
+If Investigation 4 shows that MLX's lazy eval provides structural wins
+(buffer reuse, fewer allocations, execution reordering), consider
+implementing a lightweight graph-based dispatch model:
+- Build a dispatch graph at pipeline setup time (not runtime)
+- Pre-allocate buffers with lifetime analysis
+- Encode all dispatches for one decode step in optimal order
+- This is NOT a full lazy eval runtime — it's compile-time scheduling
 
-This is more complex because the down-projection is a full matvec
-(N=2560, K=10240) that needs threadgroup-level reduction, making fusion
-with the subsequent norm non-trivial. The P1 kernel pattern could be
-adapted (it already does norm + projection; this would be projection +
-norm in reverse order).
+**Prerequisite:** Investigation 4 must show measurable CPU-side or
+buffer-management overhead.
 
-**Files:** `crates/ironmill-inference/src/metal/shaders/quantized/`,
-`crates/ironmill-inference/src/metal/shaders/norm/superblock_fused_norm.metal`
+### Inline norm recomputation
 
-### Priority 6: Eliminate intermediate buffers via register passing
-**Expected savings: ~1-2ms (eliminate norm_out DRAM traffic)**
+Eliminate the `norm_out` buffer entirely by having each projection
+kernel recompute the norm inline from `hidden_state`. Trades cheap
+compute (RMSNorm over 2560 elements) for saved DRAM traffic.
 
-The biggest remaining DRAM traffic is `norm_out`:
-- Written by fused_residual_norm (or P1 kernel)
-- Read by Q/K/V projections and FFN gate+up projections
-- Size: 2560 × 2 = 5KB per write, but read 4-6 times per layer
-
-The P1 fusion already eliminates one norm_out write+read for the first
-projection. To eliminate more, the norm computation would need to be
-fused into each projection kernel (each projection recomputes the norm
-inline from `hidden_state`). This trades compute for memory bandwidth:
-
-- Extra compute: 32 layers × 4 projections × RMSNorm(2560) ≈ negligible
-- Saved memory: 32 layers × 5KB × 5 reads = 800KB saved
-
-This requires each projection kernel to take `hidden_state` + norm
-weights as input instead of `norm_out`, computing the norm inline
-before the matvec. The norm is cheap (one reduction over hidden_size)
-relative to the matvec.
-
-**Files:** New shader variants needed. Significant shader complexity.
-
-## Implementation Order
-
-```
-P1 → P2 → P3 → P4/P5 → P6
-```
-
-P1 is a trivial code fix. P2 is investigation-only (no code changes).
-P3 may reveal that attention is the primary gap. P4-P6 are deeper
-kernel fusion work that may not be needed if P1-P3 close the gap.
+**Prerequisite:** Must show that norm_out DRAM traffic is a
+significant contributor to the gap (not currently measured).
 
 ## Measurement Protocol
 
 For each optimization, measure:
-1. **Decode tok/s** (5 runs, drop outliers, report median)
+1. **Decode tok/s** (5 runs, drop first run, report median of remaining 4)
 2. **PPL** (must remain 9.42 ±0.01)
-3. **Prefill tok/s** at 128 and 512 tokens
+3. **Prefill tok/s** at 128 and 512 tokens (must not regress)
 
-Use the existing benchmark infrastructure:
 ```bash
-# Decode + PPL
+# Decode (5 runs)
+for i in 1 2 3 4 5; do
+  cargo run --release -p ironmill-bench --features metal -- \
+    --config configs/qwen35-4b-decode-perf.toml --suite decode 2>&1 \
+    | grep 'tok/s'
+done
+
+# PPL
 cargo run --release -p ironmill-bench --features metal -- \
   --config configs/qwen35-4b-decode-perf.toml --suite decode-ppl
 
@@ -213,7 +271,7 @@ cargo run --release -p ironmill-bench --features metal -- \
 # MLX comparison
 python3 scripts/mlx_decode_bench.py --tokens 200
 
-# Per-category breakdown (requires profile-metal feature)
+# Per-category breakdown
 cargo run --release -p ironmill-bench --features metal,profile-metal -- \
   --config configs/qwen35-4b-decode-perf.toml --kernel-timing --suite decode
 ```
@@ -224,11 +282,26 @@ From the profiling infrastructure work and 6 kernel optimization
 attempts (see `metal-lazy-eval-optimization.md`):
 
 - **Dispatch count reduction**: In-encoder overhead is near-zero on M2
-  Max. Batching dispatches doesn't help.
+  Max. Batching dispatches doesn't help (validated by batched QKV
+  experiment: 2-3× micro-bench speedup → 0% end-to-end change).
 - **Kernel architecture changes**: Both ironmill and MLX use identical
   8-row/64-thread matvec with pre-scale. No kernel-level improvement
   available.
 - **Split-K / wider TGs**: GPU occupancy already saturated at K≤9216.
-- **Dual-matrix fused shaders**: FFN BW advantage comes from large N,
-  not dual-stream structure.
+- **Dual-matrix fused shaders**: FFN BW advantage comes from large N
+  (more TGs), not dual-stream structure.
 - **AMX-accelerated matvec**: 3× regression from barrier overhead.
+
+## Confidence Summary
+
+| Item | Confidence | Basis |
+|------|-----------|-------|
+| Kernels are identical (MLX vs ironmill) | **High** | Source code comparison |
+| In-encoder dispatch overhead is negligible | **High** | Measured: 0.43ms (1.9%) |
+| ironmill has more op fusion than MLX | **High** | Source code comparison |
+| GDN layers may be slower than Standard | **Unknown** | Not measured |
+| TurboQuant KV cache may slow attention | **Unknown** | Not measured |
+| MLX lazy eval provides structural advantage | **Unknown** | Not measured |
+| DRAM intermediate traffic is significant | **Unknown** | Not measured |
+| The gap is in projections/FFN | **Unknown** | No MLX breakdown |
+| The gap is in attention | **Unknown** | No MLX breakdown |
